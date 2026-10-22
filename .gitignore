@@ -1,0 +1,58 @@
+# PlatformIO / Arduino build output
+.pio/
+.pio-*/
+.pio-venv/
+.platformio-core/
+.vscode/
+
+# Runtime data and private customer configuration
+后端配置工具/data/*
+!后端配置工具/data/.gitignore
+companion/data/*
+!companion/data/.gitignore
+data/*
+!data/.gitignore
+*.log
+
+# Bundled runtimes and binary helper tools are shipped in release packages,
+# but they should not be committed to the source repository.
+companion/node/
+后端配置工具/node/
+刷固件工具/tools/*.exe
+刷固件工具/驱动/*.exe
+刷固件工具/驱动/*.EXE
+
+# Generated release packages
+交付包_*/
+交付包_*.zip
+release/
+
+# AI conversation transcripts (local session records, never uploaded)
+向我解释这个项目是干啥的-*.md
+codex-*.md
+dsh-*.md
+*-????????-????-????-????-????????????.md
+
+# Internal development notes (local only, never uploaded)
+docs/DSH开发约定.md
+
+# Single-file exe build (Node SEA): toolchain cache and build output.
+# The exe is ~90MB, so it ships inside release packages instead of the repo.
+后端配置工具/.exe-build/
+后端配置工具/*.exe
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Local backup files (kept locally, excluded from git upload)
+*.bak
+*.bak.*
+*.tmp
+*.b64
+*copy*
+* copy*
+compile_commands.json
+.clangd/
+.cache/

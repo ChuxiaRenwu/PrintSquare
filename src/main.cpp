@@ -1,0 +1,5428 @@
+// ============================================================
+// SD2 PrintSquare - ESP8266 Bambu Cloud MQTT display
+// The companion backend only provisions cloud credentials and printer choice.
+// ============================================================
+
+#include "config.h"
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <ESP8266WiFi.h>
+#include <LittleFS.h>
+#include <TFT_eSPI.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <time.h>
+
+// 中文点阵字模（PROGMEM / uint8_t 依赖 Arduino.h，必须放在其之后）
+#include "cn_stage_glyphs.h"
+
+TFT_eSPI tft;
+WiFiServer apiServer(ESP_CONFIG_PORT);
+WiFiServer webServer80(80);
+BearSSL::WiFiClientSecure mqttNet;
+
+#define LCD_BL_PIN 5
+const char *FIRMWARE_VERSION = "firmware-v0.5.40";
+
+// Color definitions for BGR565 display panel ((B<<11) | (G<<5) | R)
+#define BG_BLACK 0x0000
+#define C_RING 0x07E0 // Visual Green
+#define C_TRACK 0x2104
+#define C_TEXT 0xFFFF   // Visual White
+#define C_DIM 0x8410    // Visual Dim Gray
+#define C_CYAN 0xFFE0   // Visual Cyan
+#define C_ORANGE 0x061F // Visual Orange
+#define C_YELLOW 0x07FF // Visual Yellow
+#define C_BLUE 0xF800   // Visual Blue
+#define C_RED 0x001F    // Visual Red
+#define C_PANEL 0x3B6D
+#define C_PANEL2 0x2A6B
+#define C_PANEL3 0x4C10
+#define C_CARD 0x2903 // Cool glass card surface
+#define C_GLASS_BG 0x1881    // Visual near-black blue background
+#define C_GLASS_HI 0x7B4A    // Visual cool highlight edge
+#define C_GLASS_LO 0x1061    // Visual deep shadow edge
+
+#define FRAME_X 4
+#define FRAME_Y 4
+#define FRAME_SIZE 232
+#define FRAME_THICK 10
+#define FRAME_SIDE 232
+#define FRAME_TOTAL (FRAME_SIDE * 4)
+
+#define BAMBU_LOGO_W 24
+#define BAMBU_LOGO_H 32
+#define MAX_PRINTER_OPTIONS 16
+const uint8_t BAMBU_LOGO[] PROGMEM = {
+    0xFF, 0xE7, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF,
+    0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF,
+    0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xE7, 0xFF, 0xFF, 0xE1, 0xFF,
+    0xFF, 0xEE, 0x3F, 0xFF, 0xEF, 0x8F, 0xFF, 0xEF, 0xF1, 0xFF, 0xEF, 0xFC,
+    0xFF, 0xCF, 0xFF, 0xFE, 0x2F, 0xFF, 0xF8, 0xEF, 0xFF, 0xC7, 0xEF, 0xFF,
+    0x1F, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF,
+    0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF,
+    0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xE7, 0xFF};
+
+const char CN_READY[] PROGMEM =
+    "000000000000000000000000000000640000003000087e01c00030001c6303ff8030000cff"
+    "c78380300006c60fcf0fffc005c600fe0c30c001ffc0fc0c30c001c607df0c30c004c60e01"
+    "cc30c006c607ff8fffc00effc6318c30c00cc607ff8030000cc606318030001cc606318030"
+    "0008ffe7ff80300000c0060180300000000000000000000000000000000000000000000000"
+    "00000000000000000000000"; // 55x23
+const char CN_PRINT[] PROGMEM =
+    "0000000000000000000000000000030001c0003000033fefbfc0300003038c18c030001fc3"
+    "8c18c0300003038c18cfffc003038c18cc30c003038fd8cc30c003038c18cc30c003c38c18"
+    "cc30c01f038c18cfffc003038c18cc30c003038cd8c0300003038f9b80300003038c180030"
+    "00030300180030000e1f001800300000000000000000000000000000000000000000000000"
+    "00000000000000000000000"; // 55x23
+const char CN_PAUSE[] PROGMEM =
+    "0000000000000000000000000000000c0630c0003ff83ffc001e60200000167f67f8001f6c"
+    "661800064ce7f8003ffce000000c0c2ffc000ffc280c000c0c27f8000ffc20c0000c0c23c0"
+    "0000000000000000000000"; // 36x17
+const char CN_DONE[] PROGMEM =
+    "00000000000000000000000000000000c000d00000c000f8001ffe7ffc00180660c0000000"
+    "7ed8000ffc66d800000066f0001ffe66f000033066e80006327cec000e33c1e800183e4338"
+    "0000000000000000000000"; // 36x17
+const char CN_ERR[] PROGMEM =
+    "000000000000000000000000000000086c67f800186c7618001efe261800306c07f8003fff"
+    "e00000080067f80008fe60c0003ec66ffc0008fe61e0000ac67320000cfe76100008c62c08"
+    "0000000000000000000000"; // 36x17
+const char CN_IDLE[] PROGMEM =
+    "000000000000000000000000000000043033f0000c3033300019fefb3000103033300007ff"
+    "7330000c007b30000c0c7f30001dfff33c002c8cb23c000ccc363c000c4c363c000c3c3c38"
+    "0000000000000000000000"; // 36x17
+const char CN_NOZ[] PROGMEM =
+    "00000000000000000000000c001b40000c0f5f800f7fcb5b400f0c0b5b600f318bffc00fff"
+    "eb38000f318b3f800f000b63000f7fcbffc00f60cb66c00f64cb7fc00f6ccb66c00f6ecb7f"
+    "c00c0f0f66c00039c8c6c000e04047c0000000000000000000000000000000000000000000"
+    "00000"; // 39x23
+const char CN_BED[] PROGMEM =
+    "00000000000000000000061800380006180038001fff07ffe0061b060000065b061c00067b"
+    "061c0007fb061c001e3b47ffc0063f663c0006676e7e0006616cff000e41cddd8004cc8f9c"
+    "c00ecdcd1c400cecdc1c00086cc81c00000000000000000000000000000000000000000000"
+    "00000000"; // 39x23
+const char CN_CHAM[] PROGMEM =
+    "0000000000000000000000300c0000007806ff8000fc02c18001ce00c180038708ff800703"
+    "8cc1800fffccc180030706ff800307000000030604ffc0031e0e96c003008c96c00300cc96"
+    "c00301cc96c001ff8fffe00000040000000000000000000000000000000000000000000000"
+    "00000000"; // 39x23
+const char CN_PROGRESS[] PROGMEM =
+    "0000000000000000000004330038000c330fffe006330c000007ffccc30000330dffc00033"
+    "0cc3001e330cc30006330cff0006ffec000006730dff8006630cc38006e30c770006230c3e"
+    "000f001c7e0009ffd8e78008000b00c0000000000000000000000000000000000000000000"
+    "00000000"; // 39x23
+const char CN_TIME[] PROGMEM =
+    "0000000000000000000000000000000000000000000000001fc2038000613f80031a0781f0"
+    "6181803ffa1ce1b7f78180031a3871b06601800bba7ff9b466fd803bda0301fe66cd800bba"
+    "7ff9b666fd803bfa0301b366cd80079a1361b266fd801b623339b066c18013026309f06601"
+    "80030e0f01b3c60f8000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000"; // 63x20
+const char CN_ETA[] PROGMEM =
+    "000000000000000000000000000000000000000000003efe23006000d000c67e0006306300"
+    "7000d9f0c3020016fc7ff7ff3ffd3feb02001cc4e3060330c130c802003ff4e300003fc934"
+    "c9f2000af5e303fe32d9fcc912000af5efe000325136c9f2000af46c67ffb27136c9120008"
+    "f46c6098326933c9f20008786c6199beed30c9020008cc6fe319e1adf0c8060039846c661f"
+    "211937881e0000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000"; // 85x19
+
+struct AmsTrayInfo {
+  uint32_t trayColor = 0;
+  int remain = -1;
+  String trayType = "";
+  String traySubBrands = "";
+  String tagUid = "";
+  bool isOfficial = false;
+  bool valid = false;
+};
+
+bool isOfficialTag(const char *tag) {
+  if (!tag || strlen(tag) == 0)
+    return false;
+  for (size_t i = 0; tag[i] != '\0'; i++) {
+    if (tag[i] != '0' && tag[i] != ' ' && tag[i] != '\r' && tag[i] != '\n') {
+      return true;
+    }
+  }
+  return false;
+}
+
+struct PrinterState {
+  float progress = -1;
+  float nozzleTemp = -1;
+  float leftNozzleTemp = -1;
+  float rightNozzleTemp = -1;
+  float bedTemp = -1;
+  float chamberTemp = -1;
+  int remainingMin = -1;
+  int currentLayer = -1;
+  int totalLayers = -1;
+  String status = "prepare";
+  String displayName = "";
+  String model = "";
+  String serial = "";
+  // 未收到真实打印数据前保持 false，避免重启后在无数据时显示 PREP
+  bool online = false;
+  bool dualNozzle = false;
+  int activeTray = -1;
+  int spdLvl = -1;
+  int spdMag = -1;
+  // MQTT print.stg_cur：打印机当前细分阶段（自动调平/换料/回零等），
+  // -1 = X1 系列空闲，255 = P1 系列空闲；标签表见 cn_stage_glyphs.h。
+  int stageCur = -1;
+  bool amsExist = false;
+  AmsTrayInfo amsSlots[4];
+  AmsTrayInfo extSlot;
+};
+
+struct StoredConfig {
+  String wifiSsid = WIFI_SSID;
+  String wifiPassword = WIFI_PASSWORD;
+  String region = "cn";
+  String mqttHost = "cn.mqtt.bambulab.com";
+  String mqttUsername = "";
+  String token = "";
+  String serial = "";
+  String name = "";
+  String model = "";
+  String alias = "";
+  String layout = "classic";
+  uint16_t rotation = 0;
+  uint8_t mirror = 0; // 0 = off, 1 = left/right (MX)
+  String aliasBitmapHex = "";
+  uint8_t aliasBitmapW = 0;
+  uint8_t aliasBitmapH = 0;
+  uint8_t brightness = 100;
+  String brightnessSchedule = "";
+  // 屏幕右上角状态文字语言，由 8081 网页的中英文切换写入：
+  // "en" = 英文缩写（默认，保持原有行为）；"zh" = 中文两点阵字（cn_stage_glyphs.h）
+  String uiLang = "en";
+};
+
+struct PrinterOption {
+  String serial = "";
+  String name = "";
+  String model = "";
+};
+
+struct RenderCache {
+  bool baseDrawn = false;
+  bool offlineDrawn = false;
+  int progress = -999;
+  int progressPct = -999;
+  int nozzleTemp = -999;
+  int nozzleSide = -2;
+  int bedTemp = -999;
+  int chamberTemp = -999;
+  int remainingMin = -999;
+  int currentLayer = -999;
+  int totalLayers = -999;
+  String status = "";
+  String displayName = "";
+  String model = "";
+  String alias = "";
+  String layout = "";
+  int activeTray = -999;
+  uint32_t amsHash = 0;
+  bool amsExist = false;
+  int dashTimeRemaining = -999;
+  String dashStatus = "";
+  int spdLvl = -999;
+  int spdMag = -999;
+  int hour = -1;
+  int min = -1;
+  int sec = -1;
+  int clockProgressPct = -999;
+  int clockNozzleTemp = -999;
+  int clockBedTemp = -999;
+  int clockRemainingMin = -999;
+  String clockStatus = "";
+  bool clockOnline = true;
+  bool clockSyncDrawn = false;
+};
+
+PrinterState pr;
+StoredConfig stored;
+RenderCache cache;
+PrinterOption printerOptions[MAX_PRINTER_OPTIONS];
+uint8_t printerOptionCount = 0;
+
+unsigned long lastWifiCheck = 0;
+unsigned long lastDisplay = 0;
+unsigned long lastMqttConnect = 0;
+unsigned long lastMqttRequest = 0;
+unsigned long lastMqttPing = 0;
+unsigned long lastMqttDataReceived = 0;
+// 最近一次收到打印机遥测 PUBLISH 的时间（用于断定打印机关机）
+unsigned long lastPrinterActivity = 0;
+uint32_t mqttReconnectDelay = MQTT_RECONNECT_INTERVAL;
+bool mqttForceConnect = true;
+String lastMqttError = "";
+uint16_t mqttPacketId = 1;
+bool displayDirty = true;
+bool serverStarted = false;
+IPAddress lastRecordedIp = IPAddress(0, 0, 0, 0);
+bool setupApStarted = false;
+bool mqttReconnectPending = false;
+bool wifiReconnectPending = false;
+bool lastConfigMode = false;
+String setupApSsid;
+uint8_t mqttBuf[MQTT_BUFFER_SIZE];
+String serialConfigLine;
+String pendingHttpConfigBody;
+bool pendingHttpConfig = false;
+bool printerStatusReceived = false;
+uint8_t appliedBrightness = 0;
+
+constexpr size_t MAX_PENDING_HTTP_CLIENTS = 8;
+constexpr unsigned long HTTP_FIRST_BYTE_TIMEOUT_MS = 1500;
+constexpr uint8_t HTTP_CLIENTS_PER_LOOP = 2;
+
+struct PendingHttpClient {
+  WiFiClient client;
+  unsigned long acceptedAt = 0;
+  bool active = false;
+};
+
+PendingHttpClient pendingHttpClients[MAX_PENDING_HTTP_CLIENTS];
+
+const unsigned long DUAL_NOZZLE_SWITCH_MS = 3000;
+
+void startEspServer();
+void restartEspServer();
+bool isEspServerListening();
+bool isPrinterOnline();
+String normalizedModelName(const String &value);
+bool chamberFallbackAllowedForModel(const String &value);
+bool modelHasChamberSensor(const String &value);
+
+bool wifiHasIp() { return WiFi.localIP() != IPAddress(0, 0, 0, 0); }
+
+bool httpNetworkReady() { return wifiHasIp(); }
+
+void triggerMqttReconnect(const char *reason) {
+  if (reason && strlen(reason) > 0) {
+    lastMqttError = reason;
+    Serial.printf("[MQTT] %s, triggering reconnect\n", reason);
+  }
+  mqttNet.stop();
+  mqttForceConnect = true;
+  lastMqttConnect = 0;
+  mqttReconnectDelay = MQTT_RECONNECT_INTERVAL;
+  pr.online = false;
+  displayDirty = true;
+}
+
+bool configClientConnected() { return false; }
+
+float jsonFloat(JsonVariant v, float fallback) {
+  if (v.is<float>() || v.is<int>())
+    return v.as<float>();
+  if (v.is<const char *>())
+    return atof(v.as<const char *>());
+  return fallback;
+}
+
+int jsonInt(JsonVariant v, int fallback) {
+  if (v.is<int>())
+    return v.as<int>();
+  if (v.is<float>())
+    return (int)v.as<float>();
+  if (v.is<const char *>())
+    return atoi(v.as<const char *>());
+  return fallback;
+}
+
+const char *jsonStringForKeys(JsonObject obj, const char *const *keys,
+                              size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    const char *value = obj[keys[i]] | "";
+    if (value[0])
+      return value;
+  }
+  return "";
+}
+
+float jsonFloatForKeys(JsonObject obj, const char *const *keys, size_t count,
+                       float fallback) {
+  for (size_t i = 0; i < count; ++i) {
+    float value = jsonFloat(obj[keys[i]], fallback);
+    if (value != fallback)
+      return value;
+  }
+  return fallback;
+}
+
+int jsonIntForKeys(JsonObject obj, const char *const *keys, size_t count,
+                   int fallback) {
+  for (size_t i = 0; i < count; ++i) {
+    int value = jsonInt(obj[keys[i]], fallback);
+    if (value != fallback)
+      return value;
+  }
+  return fallback;
+}
+
+float normalizePercent(float value) {
+  if (value >= 0 && value < 1.0f)
+    return value * 100.0f;
+  return value;
+}
+
+float normalizeTemp(float value) {
+  if (value > 65535.0f)
+    return (float)(((uint32_t)value) & 0xFFFF);
+  return value;
+}
+
+void storeNozzleTemp(int side, float temp, bool invertToolSide = true) {
+  if (temp == -999)
+    return;
+  temp = normalizeTemp(temp);
+  int displaySide = side;
+  if (invertToolSide) {
+    if (side == 0)
+      displaySide = 1;
+    else if (side == 1)
+      displaySide = 0;
+  }
+  if (displaySide == 0)
+    pr.leftNozzleTemp = temp;
+  else if (displaySide == 1)
+    pr.rightNozzleTemp = temp;
+  if (pr.nozzleTemp < 0 || displaySide == 0)
+    pr.nozzleTemp = temp;
+}
+
+float firstTempFromInfo(JsonArray info, float fallback) {
+  for (JsonObject item : info) {
+    float temp = jsonFloat(item["temp"], -999);
+    if (temp != -999)
+      return normalizeTemp(temp);
+  }
+  return fallback;
+}
+
+bool applyNozzleInfo(JsonArray info) {
+  if (info.isNull() || info.size() == 0)
+    return false;
+
+  bool any = false;
+  bool dual = info.size() >= 2;
+  int index = 0;
+  for (JsonObject item : info) {
+    float temp = jsonFloat(item["temp"], -999);
+    if (temp == -999) {
+      index++;
+      continue;
+    }
+    int id = jsonInt(item["id"], index);
+    if (id == 0 || id == 1) {
+      storeNozzleTemp(id, temp);
+      any = true;
+    } else if (!dual) {
+      pr.nozzleTemp = normalizeTemp(temp);
+      any = true;
+    }
+    index++;
+  }
+  if (dual && any)
+    pr.dualNozzle = true;
+  return any;
+}
+
+bool applyNestedNozzleTemps(JsonObject print) {
+  JsonObject device = print["device"].as<JsonObject>();
+  if (device.isNull())
+    return false;
+
+  bool got = applyNozzleInfo(device["extruder"]["info"].as<JsonArray>());
+  if (applyNozzleInfo(device["nozzle"]["info"].as<JsonArray>()))
+    got = true;
+  return got;
+}
+
+float nestedNozzleTemp(JsonObject print, float fallback) {
+  JsonObject device = print["device"].as<JsonObject>();
+  if (device.isNull())
+    return fallback;
+
+  float temp =
+      firstTempFromInfo(device["extruder"]["info"].as<JsonArray>(), fallback);
+  if (temp != fallback)
+    return temp;
+  temp = firstTempFromInfo(device["nozzle"]["info"].as<JsonArray>(), fallback);
+  if (temp != fallback)
+    return temp;
+  return fallback;
+}
+
+float nestedBedTemp(JsonObject print, float fallback) {
+  JsonObject device = print["device"].as<JsonObject>();
+  if (device.isNull())
+    return fallback;
+
+  int packed = jsonInt(device["bed"]["info"]["temp"], -999);
+  if (packed != -999)
+    return normalizeTemp((float)packed);
+  float temp =
+      firstTempFromInfo(device["bed"]["info"].as<JsonArray>(), fallback);
+  if (temp != fallback)
+    return temp;
+  packed = jsonInt(device["bed_temp"], -999);
+  if (packed != -999)
+    return normalizeTemp((float)packed);
+  return fallback;
+}
+
+bool hasToken(const String &s, const char *token) {
+  String v = s;
+  v.toLowerCase();
+  return v.indexOf(token) >= 0;
+}
+
+bool isPrintingState(const String &s) {
+  return hasToken(s, "running") || hasToken(s, "printing") ||
+         hasToken(s, "processing");
+}
+
+bool isPreparingState(const String &s) {
+  return hasToken(s, "prepare") || hasToken(s, "starting") ||
+         hasToken(s, "heating") || hasToken(s, "download") ||
+         s.equalsIgnoreCase("init") || s.equalsIgnoreCase("slicing");
+}
+
+bool isPausedState(const String &s) { return hasToken(s, "pause"); }
+
+bool isFinishedState(const String &s) {
+  return hasToken(s, "finish") || hasToken(s, "success") ||
+         hasToken(s, "done") || hasToken(s, "complete");
+}
+
+bool isFailedState(const String &s) {
+  return hasToken(s, "fail") || hasToken(s, "error") || hasToken(s, "cancel");
+}
+
+uint8_t normalizeBrightness(int value) {
+  if (value < 0)
+    return 0;
+  if (value > 100)
+    return 100;
+  return (uint8_t)value;
+}
+
+void applyBrightness(uint8_t percent) {
+  percent = normalizeBrightness(percent);
+  if (appliedBrightness == percent)
+    return;
+  int duty = 1023 - ((int)percent * 1023 / 100);
+  analogWrite(LCD_BL_PIN, duty);
+  appliedBrightness = percent;
+}
+void applyBrightnessSchedule() {
+  if (stored.brightnessSchedule.length() == 0) {
+    applyBrightness(stored.brightness);
+    return;
+  }
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    applyBrightness(stored.brightness);
+    return;
+  }
+  struct tm *info = localtime(&now);
+  if (!info)
+    return;
+  int curMin = info->tm_hour * 60 + info->tm_min;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, stored.brightnessSchedule);
+  if (err) {
+    applyBrightness(stored.brightness);
+    return;
+  }
+  JsonArray arr = doc.as<JsonArray>();
+  bool matched = false;
+  for (size_t i = 0; i < arr.size(); i++) {
+    JsonObject slot = arr[i];
+    int sh = slot["sh"] | -1;
+    int sm = slot["sm"] | 0;
+    int eh = slot["eh"] | -1;
+    int em = slot["em"] | 0;
+    int b = slot["b"] | -1;
+    if (sh < 0 || eh < 0 || b < 0)
+      continue;
+    int startMin = sh * 60 + sm;
+    int endMin = eh * 60 + em;
+    bool inSlot = false;
+    if (startMin == endMin) {
+      inSlot = false;
+    } else if (endMin > startMin) {
+      inSlot = curMin >= startMin && curMin < endMin;
+    } else {
+      inSlot = curMin >= startMin || curMin < endMin;
+    }
+    if (inSlot) {
+      applyBrightness((uint8_t)b);
+      matched = true;
+      break;
+    }
+  }
+  if (!matched) {
+    applyBrightness(stored.brightness);
+  }
+}
+
+void resetLivePrintFields() {
+  pr.progress = -1;
+  pr.nozzleTemp = -1;
+  pr.leftNozzleTemp = -1;
+  pr.rightNozzleTemp = -1;
+  pr.dualNozzle = false;
+  pr.bedTemp = -1;
+  pr.chamberTemp = -1;
+  pr.remainingMin = -1;
+  pr.currentLayer = -1;
+  pr.totalLayers = -1;
+  pr.status = "prepare";
+  pr.activeTray = -1;
+  pr.spdLvl = 1;
+  pr.spdMag = 100;
+  pr.amsExist = false;
+  pr.extSlot.valid = false;
+  pr.extSlot.trayColor = 0;
+  pr.extSlot.remain = -1;
+  pr.extSlot.trayType = "";
+  pr.extSlot.traySubBrands = "";
+  pr.extSlot.tagUid = "";
+  pr.extSlot.isOfficial = false;
+  for (int i = 0; i < 4; i++) {
+    pr.amsSlots[i].valid = false;
+    pr.amsSlots[i].trayColor = 0;
+    pr.amsSlots[i].remain = -1;
+    pr.amsSlots[i].trayType = "";
+    pr.amsSlots[i].traySubBrands = "";
+    pr.amsSlots[i].tagUid = "";
+    pr.amsSlots[i].isOfficial = false;
+  }
+  printerStatusReceived = false;
+  pr.online = false;
+  displayDirty = true;
+}
+
+void wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED)
+    return;
+  if (!stored.wifiSsid.length()) {
+    Serial.println("WiFi not configured");
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.begin(stored.wifiSsid.c_str(), stored.wifiPassword.c_str());
+  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; ++i)
+    delay(500);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected, IP=");
+    Serial.println(WiFi.localIP());
+    configTime(8 * 3600, 0, "ntp.aliyun.com", "cn.pool.ntp.org",
+               "pool.ntp.org");
+  } else {
+    Serial.println("WiFi connect timeout");
+  }
+}
+
+void startSetupAp() {
+  setupApStarted = false;
+  setupApSsid = "";
+}
+
+bool saveStoredConfig() {
+  if (!LittleFS.begin())
+    return false;
+  File file = LittleFS.open("/cloud.json", "w");
+  if (!file)
+    return false;
+  JsonDocument doc;
+  doc["wifi_ssid"] = stored.wifiSsid;
+  doc["wifi_password"] = stored.wifiPassword;
+  doc["region"] = stored.region;
+  doc["mqtt_host"] = stored.mqttHost;
+  doc["mqtt_username"] = stored.mqttUsername;
+  doc["token"] = stored.token;
+  doc["serial"] = stored.serial;
+  doc["name"] = stored.name;
+  doc["model"] = stored.model;
+  doc["alias"] = stored.alias;
+  doc["layout"] = stored.layout;
+  doc["rotation"] = stored.rotation;
+  doc["mirror"] = stored.mirror;
+  doc["alias_bitmap_hex"] = stored.aliasBitmapHex;
+  doc["alias_bitmap_w"] = stored.aliasBitmapW;
+  doc["alias_bitmap_h"] = stored.aliasBitmapH;
+  doc["brightness"] = stored.brightness;
+  doc["brightness_schedule"] = stored.brightnessSchedule;
+  doc["lang"] = stored.uiLang;
+  serializeJson(doc, file);
+  file.close();
+  return true;
+}
+
+bool savePrinterOptions() {
+  if (!LittleFS.begin())
+    return false;
+  File file = LittleFS.open("/printers.json", "w");
+  if (!file)
+    return false;
+  JsonDocument doc;
+  JsonArray arr = doc["printers"].to<JsonArray>();
+  for (uint8_t i = 0; i < printerOptionCount; ++i) {
+    JsonObject item = arr.add<JsonObject>();
+    item["serial"] = printerOptions[i].serial;
+    item["name"] = printerOptions[i].name;
+    item["model"] = printerOptions[i].model;
+  }
+  serializeJson(doc, file);
+  file.close();
+  return true;
+}
+
+void clearPrinterOptions() {
+  for (uint8_t i = 0; i < MAX_PRINTER_OPTIONS; ++i) {
+    printerOptions[i].serial = "";
+    printerOptions[i].name = "";
+    printerOptions[i].model = "";
+  }
+  printerOptionCount = 0;
+}
+
+bool loadPrinterArray(JsonArray arr) {
+  if (arr.isNull())
+    return false;
+  clearPrinterOptions();
+  for (JsonObject item : arr) {
+    if (printerOptionCount >= MAX_PRINTER_OPTIONS)
+      break;
+    const char *serial =
+        item["serial"] | item["dev_id"] | item["device_id"] | "";
+    if (!serial[0])
+      continue;
+    printerOptions[printerOptionCount].serial = serial;
+    printerOptions[printerOptionCount].name =
+        item["name"] | item["display_name"] | item["dev_name"] | serial;
+    printerOptions[printerOptionCount].model = item["model"] | "";
+    printerOptionCount++;
+  }
+  return true;
+}
+
+void loadPrinterOptions() {
+  clearPrinterOptions();
+  if (!LittleFS.begin())
+    return;
+  if (!LittleFS.exists("/printers.json"))
+    return;
+  File file = LittleFS.open("/printers.json", "r");
+  if (!file)
+    return;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, file);
+  file.close();
+  if (err)
+    return;
+  loadPrinterArray(doc["printers"].as<JsonArray>());
+}
+
+void loadStoredConfig() {
+  if (!LittleFS.begin())
+    return;
+  if (!LittleFS.exists("/cloud.json"))
+    return;
+  File file = LittleFS.open("/cloud.json", "r");
+  if (!file)
+    return;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, file);
+  file.close();
+  if (err)
+    return;
+  stored.wifiSsid = doc["wifi_ssid"] | stored.wifiSsid;
+  stored.wifiPassword = doc["wifi_password"] | stored.wifiPassword;
+  stored.region = doc["region"] | stored.region;
+  stored.mqttHost = doc["mqtt_host"] | stored.mqttHost;
+  stored.mqttUsername = doc["mqtt_username"] | "";
+  stored.token = doc["token"] | "";
+  stored.serial = doc["serial"] | "";
+  stored.name = doc["name"] | "";
+  stored.model = doc["model"] | "";
+  stored.alias = doc["alias"] | "";
+  stored.layout = doc["layout"] | "classic";
+  int savedRotation = doc["rotation"] | 0;
+  stored.rotation = (savedRotation == 90 || savedRotation == 180 || savedRotation == 270) ? (uint16_t)savedRotation : 0;
+  int savedMirror = doc["mirror"] | 0;
+  stored.mirror = (savedMirror == 1) ? (uint8_t)savedMirror : 0;
+  stored.aliasBitmapHex = doc["alias_bitmap_hex"] | "";
+  stored.aliasBitmapW = doc["alias_bitmap_w"] | 0;
+  stored.aliasBitmapH = doc["alias_bitmap_h"] | 0;
+  stored.brightness = normalizeBrightness(doc["brightness"] | 100);
+  stored.brightnessSchedule = doc["brightness_schedule"] | "";
+  {
+    const char *savedLang = doc["lang"] | "en";
+    stored.uiLang = (strcmp(savedLang, "zh") == 0) ? "zh" : "en";
+  }
+  pr.serial = stored.serial;
+  pr.displayName = stored.name;
+  pr.model = stored.model;
+}
+
+String compactMac() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  mac.toLowerCase();
+  return mac;
+}
+
+String stageAbbrevText();
+String cnLabelText(uint8_t label);
+uint8_t currentCnLabel();
+uint8_t genericCnLabel();
+uint8_t stageOnlyCnLabel();
+
+String statusJson() {
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["chip_id"] = String(ESP.getChipId(), HEX);
+  doc["mac"] = WiFi.macAddress();
+  doc["device_id"] = String("esp-") + compactMac();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["ap_ip"] = "";
+  doc["ap_ssid"] = "";
+  doc["serial"] = pr.serial.length() ? pr.serial : stored.serial;
+  doc["name"] = pr.displayName.length() ? pr.displayName : stored.name;
+  doc["model"] =
+      normalizedModelName(pr.model.length() ? pr.model : stored.model);
+  doc["layout"] = stored.layout;
+  doc["rotation"] = stored.rotation;
+  doc["mirror"] = stored.mirror;
+  doc["mqtt_host"] = stored.mqttHost;
+  doc["mqtt_username"] = stored.mqttUsername.length() ? "set" : "";
+  doc["mqtt_connected"] = mqttNet.connected();
+  if (lastMqttError.length() > 0) {
+    doc["mqtt_error"] = lastMqttError;
+  }
+  doc["brightness"] = appliedBrightness;
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["printer_count"] = printerOptionCount;
+  doc["online"] = pr.online;
+  doc["status"] = pr.status;
+  doc["stage_cur"] = pr.stageCur;
+  doc["stage_text"] = stageAbbrevText();
+  // 中文标签：stage_cn 仅在确实有细分阶段时非空；status_cn 是通用状态中文
+  {
+    uint8_t stageLabel = stageOnlyCnLabel();
+    doc["stage_cn"] = (stageLabel != CN_LBL_NONE) ? cnLabelText(stageLabel) : "";
+  }
+  doc["status_cn"] = cnLabelText(genericCnLabel());
+  doc["lang"] = stored.uiLang;
+  doc["progress"] = pr.progress;
+  doc["nozzle_temp"] = pr.nozzleTemp;
+  doc["left_nozzle_temp"] = pr.leftNozzleTemp;
+  doc["right_nozzle_temp"] = pr.rightNozzleTemp;
+  doc["dual_nozzle"] = pr.dualNozzle;
+  doc["bed_temp"] = pr.bedTemp;
+  bool hasChamber = modelHasChamberSensor(pr.model.length() ? pr.model : stored.model);
+  doc["has_chamber_sensor"] = hasChamber;
+  doc["chamber_temp"] = hasChamber ? pr.chamberTemp : -1;
+  doc["remaining_min"] = pr.remainingMin;
+  doc["current_layer"] = pr.currentLayer;
+  doc["total_layers"] = pr.totalLayers;
+  doc["spd_lvl"] = pr.spdLvl;
+  doc["spd_mag"] = pr.spdMag;
+  if (pr.amsExist) {
+    JsonArray amsArr = doc["ams"].to<JsonArray>();
+    for (int i = 0; i < 4; ++i) {
+      // AMS 接入后固定输出 4 个槽位：未插耗材的槽位保留占位（valid=false，前端显示"空"）
+      JsonObject t = amsArr.add<JsonObject>();
+      t["id"] = i;
+      t["valid"] = pr.amsSlots[i].valid;
+      t["active"] = (pr.activeTray == i);
+      if (pr.amsSlots[i].valid) {
+        char hex[10];
+        snprintf(hex, sizeof(hex), "#%02x%02x%02x",
+                 (uint8_t)(pr.amsSlots[i].trayColor >> 24),
+                 (uint8_t)(pr.amsSlots[i].trayColor >> 16),
+                 (uint8_t)(pr.amsSlots[i].trayColor >> 8));
+        t["color"] = hex;
+        t["type"] = pr.amsSlots[i].trayType;
+        t["remain"] = (pr.amsSlots[i].isOfficial && pr.amsSlots[i].remain >= 0 && pr.amsSlots[i].remain <= 100) ? pr.amsSlots[i].remain : -1;
+        t["official"] = pr.amsSlots[i].isOfficial;
+      } else {
+        t["color"] = "";
+        t["type"] = "";
+        t["remain"] = -1;
+        t["official"] = false;
+      }
+    }
+  }
+  if (pr.extSlot.valid) {
+    JsonObject ext = doc["ext"].to<JsonObject>();
+    char hex[10];
+    snprintf(hex, sizeof(hex), "#%02x%02x%02x",
+             (uint8_t)(pr.extSlot.trayColor >> 24),
+             (uint8_t)(pr.extSlot.trayColor >> 16),
+             (uint8_t)(pr.extSlot.trayColor >> 8));
+    ext["color"] = hex;
+    ext["type"] = pr.extSlot.trayType;
+    ext["remain"] = (pr.extSlot.isOfficial && pr.extSlot.remain >= 0 && pr.extSlot.remain <= 100) ? pr.extSlot.remain : -1;
+    ext["official"] = pr.extSlot.isOfficial;
+    // tray_now: 254 = 外挂料盘；255 = 没有选中任何料盘（不是外挂），不能算作外挂在用。
+    ext["active"] = (pr.activeTray == 254);
+  }
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+String jsonEscape(const String &text) {
+  String out;
+  out.reserve(text.length() + 8);
+  for (size_t i = 0; i < text.length(); ++i) {
+    char c = text[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if ((uint8_t)c < 0x20) {
+      char buf[7];
+      snprintf(buf, sizeof(buf), "\\u%04x", (uint8_t)c);
+      out += buf;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+int rssiToSignal(int32_t rssi) {
+  if (rssi <= -100)
+    return 0;
+  if (rssi >= -50)
+    return 100;
+  return 2 * (rssi + 100);
+}
+
+String wifiScanJson() {
+  int count = WiFi.scanNetworks(false, true);
+  String out = "{\"ok\":true,\"source\":\"esp\",\"networks\":[";
+  int added = 0;
+  for (int i = 0; i < count && added < 24; ++i) {
+    String ssid = WiFi.SSID(i);
+    if (!ssid.length())
+      continue;
+    bool duplicate = false;
+    for (int j = 0; j < i; ++j) {
+      if (WiFi.SSID(j) == ssid) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate)
+      continue;
+    int32_t rssi = WiFi.RSSI(i);
+    if (added)
+      out += ',';
+    out += "{\"ssid\":\"";
+    out += jsonEscape(ssid);
+    out += "\",\"rssi\":";
+    out += String(rssi);
+    out += ",\"signal\":";
+    out += String(rssiToSignal(rssi));
+    out += "}";
+    added++;
+  }
+  WiFi.scanDelete();
+  out += "],\"count\":";
+  out += String(added);
+  out += "}";
+  return out;
+}
+
+String htmlEscape(const String &text) {
+  String out;
+  out.reserve(text.length() + 8);
+  for (size_t i = 0; i < text.length(); ++i) {
+    char c = text[i];
+    if (c == '&')
+      out += "&amp;";
+    else if (c == '<')
+      out += "&lt;";
+    else if (c == '>')
+      out += "&gt;";
+    else if (c == '"')
+      out += "&quot;";
+    else
+      out += c;
+  }
+  return out;
+}
+
+String printersJson() {
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["selected_serial"] = stored.serial;
+  JsonArray arr = doc["printers"].to<JsonArray>();
+  for (uint8_t i = 0; i < printerOptionCount; ++i) {
+    JsonObject item = arr.add<JsonObject>();
+    item["serial"] = printerOptions[i].serial;
+    item["name"] = printerOptions[i].name;
+    item["model"] = printerOptions[i].model;
+    item["selected"] = printerOptions[i].serial == stored.serial;
+  }
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+bool selectPrinterBySerial(const String &serial) {
+  if (!serial.length())
+    return false;
+  for (uint8_t i = 0; i < printerOptionCount; ++i) {
+    if (printerOptions[i].serial == serial) {
+      if (stored.serial != printerOptions[i].serial) {
+        stored.serial = printerOptions[i].serial;
+        stored.name = printerOptions[i].name.length()
+                          ? printerOptions[i].name
+                          : printerOptions[i].serial;
+        pr.serial = stored.serial;
+        pr.displayName = stored.name;
+        pr.progress = -1;
+        pr.nozzleTemp = -1;
+        pr.leftNozzleTemp = -1;
+        pr.rightNozzleTemp = -1;
+        pr.dualNozzle = false;
+        pr.bedTemp = -1;
+        pr.remainingMin = -1;
+        pr.currentLayer = -1;
+        pr.totalLayers = -1;
+        pr.status = "prepare";
+        printerStatusReceived = false;
+        pr.online = false;
+        cache.baseDrawn = false;
+        mqttReconnectPending = true;
+      }
+      saveStoredConfig();
+      displayDirty = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+class ChunkedBufferedPrinter : public Print {
+  WiFiClient& client;
+  static uint8_t buf[1024];
+  size_t pos;
+  bool finished;
+public:
+  ChunkedBufferedPrinter(WiFiClient& c) : client(c), pos(0), finished(false) {
+    client.setNoDelay(true);
+  }
+  ~ChunkedBufferedPrinter() {
+    finish();
+  }
+  size_t write(uint8_t c) override {
+    if (finished || !client.connected()) {
+      finished = true;
+      pos = 0;
+      return 0;
+    }
+    buf[pos++] = c;
+    if (pos >= sizeof(buf)) {
+      flushBuffer();
+    }
+    return 1;
+  }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    if (finished || !client.connected()) {
+      finished = true;
+      pos = 0;
+      return 0;
+    }
+    size_t written = 0;
+    while (size > 0 && !finished && client.connected()) {
+      size_t space = sizeof(buf) - pos;
+      size_t chunk = (size < space) ? size : space;
+      if (chunk > 0) {
+        memcpy(buf + pos, buffer, chunk);
+        pos += chunk;
+        written += chunk;
+        buffer += chunk;
+        size -= chunk;
+      }
+      if (pos >= sizeof(buf)) {
+        flushBuffer();
+      }
+    }
+    if (!client.connected()) {
+      finished = true;
+      pos = 0;
+    }
+    return written;
+  }
+  void flushBuffer() {
+    if (pos == 0) return;
+    if (client.connected()) {
+      client.printf("%X\r\n", pos);
+      size_t written = 0;
+      unsigned long wStart = millis();
+      while (written < pos && client.connected() && (millis() - wStart < 2500)) {
+        size_t n = client.write(buf + written, pos - written);
+        if (n > 0) {
+          written += n;
+          wStart = millis();
+        } else {
+          delay(1);
+          ESP.wdtFeed();
+          optimistic_yield(1000);
+        }
+      }
+      if (client.connected()) {
+        client.print("\r\n");
+      }
+      ESP.wdtFeed();
+      optimistic_yield(1000);
+    }
+    pos = 0;
+  }
+  void flush() {
+    flushBuffer();
+  }
+  void finish() {
+    if (finished) return;
+    finished = true;
+    flushBuffer();
+    if (client.connected()) {
+      client.print(F("0\r\n\r\n"));
+      ESP.wdtFeed();
+    }
+    pos = 0;
+  }
+  void stop() {
+    finish();
+  }
+};
+uint8_t ChunkedBufferedPrinter::buf[1024];
+
+void sendEspHomeHtml(WiFiClient &realClient) {
+  realClient.setNoDelay(true);
+  realClient.print(F("HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/html; charset=utf-8\r\n"
+                     "Transfer-Encoding: chunked\r\n"
+                     "Cache-Control: no-store\r\n"
+                     "Connection: close\r\n\r\n"));
+
+  ChunkedBufferedPrinter client(realClient);
+
+  String ip = WiFi.localIP().toString();
+  String selected = stored.name.length() ? stored.name : stored.serial;
+  String modelName = normalizedModelName(stored.model);
+  bool hasSchedule = stored.brightnessSchedule.length() > 2;
+
+  
+  
+  client.print( F(
+      "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta "
+      "name=\"viewport\" content=\"width=device-width,initial-scale=1\">"));
+  client.print(
+      F("<link rel=\"icon\" type=\"image/svg+xml\" "
+        "href=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
+        "viewBox='0 0 100 120'%3E%3Crect width='100' height='120' rx='16' "
+        "fill='%230b0e17'/%3E%3Cpolygon points='13,13 47,13 47,54 13,69' "
+        "fill='%23ffffff'/%3E%3Cpolygon points='13,75 47,60 47,107 13,107' "
+        "fill='%23ffffff'/%3E%3Cpolygon points='53,13 87,13 87,55 53,39' "
+        "fill='%23ffffff'/%3E%3Cpolygon points='53,45 87,61 87,107 53,107' "
+        "fill='%23ffffff'/%3E%3C/svg%3E\">"));
+  client.print( F("<title>PrintSquare</title><style>"));
+  client.print( F("*{box-sizing:border-box;margin:0;padding:0;font-family:-apple-"
+            "system,BlinkMacSystemFont,\"SF Pro Display\",\"SF Pro "
+            "Text\",\"Segoe UI\",Roboto,sans-serif}"));
+  client.print( F("body{background:#0b0e17;background-image:radial-gradient(at 0% "
+            "0%,rgba(0,122,255,0.18) 0px,transparent 50%),radial-gradient(at "
+            "100% 100%,rgba(175,82,222,0.18) 0px,transparent "
+            "50%);color:#f2f2f7;min-height:100vh;padding:24px "
+            "16px;display:flex;justify-content:center;align-items:flex-start}"));
+  client.print( F(".container{width:100%;max-width:880px}"));
+  client.print( F(".header{margin-bottom:24px;text-align:left}"));
+  client.print( F(".header "
+            "h1{font-size:28px;font-weight:700;letter-spacing:-0.5px;"
+            "background:linear-gradient(135deg,#ffffff 0%,#a1a1a6 "
+            "100%);-webkit-background-clip:text;-webkit-text-fill-color:"
+            "transparent}"));
+  client.print( F(".header .sub{color:#8e8e93;font-size:14px;margin-top:4px}"));
+  client.print( F(".hdr-row{display:flex;justify-content:space-between;align-items:"
+            "center;gap:12px;flex-wrap:wrap}"));
+  client.print( F(".lang-switch{display:flex;background:rgba(0,0,0,0.3);padding:3px;"
+            "border-radius:12px;border:1px solid rgba(255,255,255,0.08);gap:4px;"
+            "flex:0 0 auto}"));
+  client.print( F(".lang-switch button{padding:6px 14px;border:none;border-radius:9px;"
+            "background:transparent;color:#98989d;font-size:13px;font-weight:500;"
+            "cursor:pointer;box-shadow:none;transition:all .2s ease}"));
+  client.print( F(".lang-switch button.active{background:rgba(255,255,255,0.2);color:"
+            "#ffffff;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,0.25)}"));
+  client.print( F(".lang-switch button:hover{background:rgba(255,255,255,0.12);color:"
+            "#ffffff}"));
+  client.print( F(".grid{display:grid;grid-template-columns:1fr;gap:16px}@media(min-"
+            "width:640px){.grid{grid-template-columns:repeat(2,1fr)}}"));
+  client.print( F(".paired-grid{display:grid;grid-template-columns:1fr;gap:16px;grid-column:1 / -1}"
+            "@media(min-width:640px){.paired-grid{grid-template-columns:repeat(2,1fr)}}"));
+  client.print( F(".glass{background:rgba(255,255,255,0.06);-webkit-backdrop-filter:"
+            "blur(30px) saturate(190%);backdrop-filter:blur(30px) "
+            "saturate(190%);border:1px solid "
+            "rgba(255,255,255,0.12);border-radius:20px;padding:20px;box-shadow:"
+            "0 8px 32px 0 rgba(0,0,0,0.37);transition:transform .2s "
+            "ease,border-color .2s ease}"));
+  client.print( F(".glass:hover{border-color:rgba(255,255,255,0.22)}"));
+  client.print( F(".debug-card{align-self:start;max-height:320px}"
+            ".debug-card pre{max-height:240px;margin-bottom:0}"));
+  client.print(
+      F(".glass "
+        "h2{font-size:16px;font-weight:600;color:#f2f2f7;margin-bottom:14px;"
+        "display:flex;align-items:center;justify-content:space-between}"));
+  client.print(
+      F(".row{display:flex;justify-content:space-between;align-items:center;"
+        "padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05)}"));
+  client.print( F(".row:last-child{border-bottom:none}"));
+  client.print( F(".label{color:#98989d;font-size:14px}"));
+  client.print( F(".value{color:#ffffff;font-size:14px;font-weight:500}"));
+  client.print( F(".badge{padding:4px "
+            "10px;border-radius:12px;font-size:12px;font-weight:600;display:"
+            "inline-block}"));
+  client.print( F(".badge.ok{background:rgba(52,199,89,0.2);color:#30d158;border:1px "
+            "solid rgba(52,199,89,0.3)}"));
+  client.print( F(".badge.err{background:rgba(255,69,58,0.2);color:#ff453a;border:"
+            "1px solid rgba(255,69,58,0.3)}"));
+  client.print( F(".badge.warn{background:rgba(255,159,10,0.2);color:#ff9f0a;border:1px "
+            "solid rgba(255,159,10,0.3)}"));
+  client.print( F(".badge.info{background:rgba(10,132,255,0.2);color:#0a84ff;border:1px "
+            "solid rgba(10,132,255,0.3)}"));
+  client.print( F(".badge.muted{background:rgba(142,142,147,0.18);color:#8e8e93;border:1px "
+            "solid rgba(142,142,147,0.25)}"));
+  client.print( F(".metrics-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;"
+            "margin-top:14px}@media(min-width:640px){.metrics-grid{grid-template-columns:repeat(3,1fr);gap:12px}}"));
+  client.print( F(".metric-item{background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);"
+            "border-radius:14px;padding:10px 14px}"));
+  client.print( F(".m-label{color:#8e8e93;font-size:12px;margin-bottom:4px;display:flex;align-items:center;gap:4px}"));
+  client.print( F(".m-val{color:#ffffff;font-size:16px;font-weight:600}"));
+  client.print( F(".prog-track{background:rgba(255,255,255,0.08);height:8px;border-radius:4px;"
+            "overflow:hidden;margin-top:8px}"));
+  client.print( F(".prog-fill{height:100%;width:0%;background:linear-gradient(90deg,#0a84ff,#30d158);"
+            "border-radius:4px;transition:width .4s ease}"));
+  client.print( F(".ams-pill{background:rgba(0,0,0,0.35);border:1px solid rgba(255,255,255,0.12);"
+            "border-radius:10px;padding:5px 9px;display:flex;align-items:center;gap:6px;font-size:12px}"));
+  client.print( F(".ams-pill.active{border-color:#30d158;box-shadow:0 0 8px rgba(48,209,88,0.35)}"));
+  client.print( F(".ams-dot{width:10px;height:10px;border-radius:50%;display:inline-block;"
+            "border:1px solid rgba(255,255,255,0.3)}"));
+  client.print( F(".slider-container{margin-top:10px;text-align:center}"));
+  client.print( F(".slider-val{font-size:32px;font-weight:700;color:#0a84ff;letter-"
+            "spacing:-1px;margin-bottom:8px}"));
+  client.print( F("input[type=range]{width:100%;height:8px;-webkit-appearance:none;"
+            "background:rgba(255,255,255,0.12);border-radius:4px;outline:none;"
+            "margin:8px 0;transition:opacity .2s}"));
+  client.print(
+      F("input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:"
+        "22px;height:22px;border-radius:50%;background:#ffffff;box-shadow:0 "
+        "2px 8px rgba(0,0,0,0.4);cursor:pointer;transition:transform .1s "
+        "ease,background .2s ease}"));
+  client.print( F(
+      "input[type=range]::-webkit-slider-thumb:active{transform:scale(1.15)}"));
+  client.print( F("input[type=range]:disabled{opacity:0.25;cursor:not-allowed}"));
+  client.print( F("input[type=range]:disabled::-webkit-slider-thumb{background:#"
+            "636366;box-shadow:none;cursor:not-allowed}"));
+  client.print(
+      F(".segmented{display:flex;background:rgba(0,0,0,0.3);padding:3px;border-"
+        "radius:12px;border:1px solid rgba(255,255,255,0.08);gap:4px}"));
+  client.print( F(
+      ".segmented button{flex:1;padding:8px "
+      "12px;border:none;border-radius:9px;background:transparent;color:#98989d;"
+      "font-size:13px;font-weight:500;cursor:pointer;transition:all .2s ease}"));
+  client.print( F(".segmented "
+            "button.active{background:rgba(255,255,255,0.2);color:#ffffff;box-"
+            "shadow:0 2px 8px rgba(0,0,0,0.25);font-weight:600}"));
+  client.print( F(
+      ".switch{position:relative;display:inline-block;width:48px;height:28px}"));
+  client.print( F(".switch input{opacity:0;width:0;height:0}"));
+  client.print( F(".slider-round{position:absolute;cursor:pointer;top:0;left:0;right:"
+            "0;bottom:0;background:rgba(255,255,255,0.15);border-radius:28px;"
+            "transition:.3s;border:1px solid rgba(255,255,255,0.1)}"));
+  client.print( F(".slider-round:before{position:absolute;content:\"\";height:22px;"
+            "width:22px;left:2px;bottom:2px;background:#ffffff;border-radius:"
+            "50%;transition:.3s;box-shadow:0 2px 4px rgba(0,0,0,0.3)}"));
+  client.print( F("input:checked + .slider-round{background:#34c759}"));
+  client.print( F("input:checked + .slider-round:before{transform:translateX(20px)}"));
+  client.print( F(".slot-box{background:rgba(0,0,0,0.2);border:1px solid "
+            "rgba(255,255,255,0.08);border-radius:14px;padding:12px;margin-top:"
+            "10px}"));
+  client.print( F(".slot-row{display:flex;align-items:center;justify-content:space-"
+            "between;gap:8px;margin-bottom:8px}"));
+  client.print( F(".slot-row:last-child{margin-bottom:0}"));
+  client.print(
+      F("input[type=time]{background:rgba(255,255,255,0.1);border:1px solid "
+        "rgba(255,255,255,0.15);border-radius:8px;color:#fff;padding:4px "
+        "8px;font-size:13px;outline:none}"));
+  client.print( F("pre{background:rgba(0,0,0,0.4);border:1px solid "
+            "rgba(255,255,255,0.1);border-radius:12px;padding:12px;font-size:"
+            "12px;color:#30d158;overflow-x:auto;white-space:pre-wrap;margin-"
+            "top:12px;display:none}"));
+  client.print( F(".btn-action{background:rgba(255,255,255,0.1);border:1px solid "
+            "rgba(255,255,255,0.15);color:#0a84ff;padding:6px "
+            "14px;border-radius:10px;font-size:13px;font-weight:500;cursor:"
+            "pointer;transition:all .2s}"));
+  client.print( F(".btn-action:hover{background:rgba(255,255,255,0.18)}"));
+  client.print( F(".btn-primary{width:100%;padding:10px "
+            "16px;margin-top:14px;background:linear-gradient(135deg,#0a84ff "
+            "0%,#0066cc 100%);border:1px solid "
+            "rgba(255,255,255,0.25);border-radius:12px;color:#ffffff;font-size:"
+            "14px;font-weight:600;cursor:pointer;box-shadow:0 4px 16px "
+            "rgba(10,132,255,0.35);transition:all .2s ease}"));
+  client.print( F(".btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px "
+            "20px rgba(10,132,255,0.5)}"));
+  client.print( F(".btn-primary:active{transform:translateY(0)}"));
+  client.print( F(".toast{position:fixed;bottom:24px;left:50%;transform:translateX(-"
+            "50%);background:rgba(40,40,40,0.9);-webkit-backdrop-filter:blur("
+            "20px);backdrop-filter:blur(20px);color:#fff;padding:10px "
+            "22px;border-radius:20px;font-size:13px;font-weight:500;border:1px "
+            "solid rgba(255,255,255,0.2);box-shadow:0 10px 30px "
+            "rgba(0,0,0,0.5);opacity:0;pointer-events:none;transition:opacity "
+            ".3s ease;z-index:999}"));
+  client.print( F(".toast.show{opacity:1}"));
+  client.print( F("</style></head><body><div class=\"container\">"));
+
+  client.print( F("<div class=\"header\"><div class=\"hdr-row\"><h1>PrintSquare"
+            "</h1><div class=\"lang-switch\"><button id=\"langZh\" "
+            "onclick=\"setLang('zh')\">中文</button><button id=\"langEn\" "
+            "onclick=\"setLang('en')\">English</button></div></div><p "
+            "class=\"sub\">固件: "));
+  client.print( FIRMWARE_VERSION);
+  client.print( F(" | IP: "));
+  client.print( htmlEscape(ip));
+  client.print( F("</p></div>"));
+
+  client.print( F("<div class=\"grid\">"));
+
+  // Dedicated Card: Printer Live Status
+  client.print( F("<div class=\"glass\" style=\"grid-column:1 / -1\">"));
+  client.print( F("<div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:12px\">"
+                  "<h2 style=\"margin-bottom:0\">打印机实时状态</h2>"
+                  "<span id=\"pStatusBadge\" class=\"badge "));
+  {
+    String st = pr.status;
+    st.toLowerCase();
+    if (!pr.online) {
+      client.print( F("muted\">离线"));
+    } else if (st == "running" || st == "printing") {
+      client.print( F("ok\">打印中"));
+    } else if (st == "prepare" || st == "preparing") {
+      client.print( F("info\">准备中"));
+    } else if (st == "pause" || st == "paused") {
+      client.print( F("warn\">已暂停"));
+    } else if (st == "finish" || st == "finished" || st == "done" || pr.progress >= 100) {
+      client.print( F("ok\">已完成"));
+    } else {
+      client.print( F("muted\">待机"));
+    }
+  }
+  client.print( F("</span></div>"));
+
+  // Progress Bar
+  client.print( F("<div><div style=\"display:flex;justify-content:space-between;align-items:baseline\">"
+                  "<span class=\"label\">任务进度</span><span id=\"pProgressVal\" style=\"font-size:24px;font-weight:700;color:#0a84ff\">"));
+  if (pr.progress >= 0) {
+    client.print( String((int)pr.progress) + "%" );
+  } else {
+    client.print( (pr.status == "finish") ? "100%" : "--" );
+  }
+  client.print( F("</span></div><div class=\"prog-track\"><div id=\"pProgressBar\" class=\"prog-fill\" style=\"width:"));
+  if (pr.progress >= 0) {
+    client.print( String((int)pr.progress) + "%" );
+  } else {
+    client.print( (pr.status == "finish") ? "100%" : "0%" );
+  }
+  client.print( F("\"></div></div></div>"));
+
+  // Metrics Grid
+  client.print( F("<div class=\"metrics-grid\">"));
+  // 1. Remaining Time
+  client.print( F("<div class=\"metric-item\"><div class=\"m-label\">⏱️ 剩余时间</div><div id=\"pRemain\" class=\"m-val\">"));
+  if (pr.status == "finish" || pr.progress >= 100) {
+    client.print( F("已完成") );
+  } else if (pr.remainingMin > 0) {
+    int h = pr.remainingMin / 60;
+    int m = pr.remainingMin % 60;
+    if (h > 0) client.print( String(h) + "小时 " + String(m) + "分" );
+    else client.print( String(m) + "分钟" );
+  } else if (pr.remainingMin == 0) {
+    client.print( F("即将完成") );
+  } else {
+    client.print( F("--") );
+  }
+  client.print( F("</div></div>"));
+
+  // 2. Layer
+  client.print( F("<div class=\"metric-item\"><div class=\"m-label\">📑 打印层数</div><div id=\"pLayer\" class=\"m-val\">"));
+  if (pr.currentLayer >= 0) {
+    if (pr.totalLayers > 0) client.print( String(pr.currentLayer) + " / " + String(pr.totalLayers) );
+    else client.print( String(pr.currentLayer) );
+  } else {
+    client.print( F("--") );
+  }
+  client.print( F("</div></div>"));
+
+  // 3. Nozzle Temp
+  client.print( F("<div class=\"metric-item\"><div class=\"m-label\">🌡️ 喷嘴温度</div><div id=\"pNozzle\" class=\"m-val\">"));
+  if (pr.nozzleTemp > 0) {
+    client.print( String(pr.nozzleTemp, 1) + " ℃" );
+  } else {
+    client.print( F("-- ℃") );
+  }
+  client.print( F("</div></div>"));
+
+  // 4. Bed Temp
+  client.print( F("<div class=\"metric-item\"><div class=\"m-label\">🛏️ 热床温度</div><div id=\"pBed\" class=\"m-val\">"));
+  if (pr.bedTemp > 0) {
+    client.print( String(pr.bedTemp, 1) + " ℃" );
+  } else {
+    client.print( F("-- ℃") );
+  }
+  client.print( F("</div></div>"));
+
+  // 5. Chamber Temp
+  client.print( F("<div class=\"metric-item\"><div class=\"m-label\">📦 机箱温度</div><div id=\"pChamber\" class=\"m-val\">"));
+  if (!modelHasChamberSensor(modelName)) {
+    client.print( F("N/A") );
+  } else if (pr.chamberTemp > 0) {
+    client.print( String(pr.chamberTemp, 1) + " ℃" );
+  } else {
+    client.print( F("--") );
+  }
+  client.print( F("</div></div>"));
+
+  // 6. Speed
+  client.print( F("<div class=\"metric-item\"><div class=\"m-label\">⚡ 打印速度</div><div id=\"pSpeed\" class=\"m-val\">"));
+  if (pr.spdLvl == 1) client.print( F("静音 (50%)") );
+  else if (pr.spdLvl == 3) client.print( F("运动 (124%)") );
+  else if (pr.spdLvl == 4) client.print( F("狂暴 (166%)") );
+  else if (pr.spdLvl == 2) client.print( F("标准 (100%)") );
+  else client.print( F("--") );
+  client.print( F("</div></div>"));
+
+  // 7. Detailed stage (当前动作): 占满整行；右侧补上 MQTT 原始状态码与一句说明
+  client.print( F("<div class=\"metric-item\" style=\"grid-column:1 / -1;display:flex;"
+                  "align-items:center;gap:16px;flex-wrap:wrap\">"
+                  "<div style=\"min-width:104px\">"
+                  "<div class=\"m-label\">🔧 当前动作</div>"
+                  "<div id=\"pStage\" class=\"m-val\">"));
+  {
+    String stage = stageAbbrevText();
+    client.print(stage.length() ? stage : String("--"));
+  }
+  client.print( F("</div></div>"
+                  "<div style=\"display:flex;gap:8px;flex-wrap:wrap\">"
+                  "<span id=\"pCodeState\" class=\"badge muted\">gcode_state=--</span>"
+                  "<span id=\"pCodeStage\" class=\"badge muted\">stg_cur=--</span>"
+                  "</div>"
+                  "<div id=\"pStageNote\" style=\"color:#8e8e93;font-size:12px;line-height:1.5;"
+                  "flex:1;min-width:150px\">--</div>"
+                  "</div></div>"));
+
+  // Filament / AMS Box
+  client.print( F("<div id=\"pAmsBox\" style=\"margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.06);display:none\">"
+                  "<div class=\"m-label\" style=\"margin-bottom:8px\">🧵 耗材状态</div>"
+                  "<div id=\"pAmsSlots\" style=\"display:flex;gap:8px;flex-wrap:wrap\"></div></div></div>"));
+
+  // Card 1: Device Status
+  client.print( F("<div class=\"glass\"><h2>设备状态</h2>"));
+  client.print( F("<div class=\"row\"><span class=\"label\">打印机</span><span id=\"stPrinter\" class=\"value\">"));
+  client.print( htmlEscape(selected.length() ? selected : String("未选择")));
+  client.print( F("</span></div>"));
+  client.print( F("<div class=\"row\"><span class=\"label\">机型</span><span id=\"stModel\" class=\"value\">"));
+  client.print( htmlEscape(modelName));
+  client.print( F("</span></div>"));
+  client.print( F("<div class=\"row\"><span class=\"label\">状态</span><span id=\"stStatus\" class=\"value\">"));
+  client.print( htmlEscape(pr.status.length() ? pr.status : String("待机")));
+  client.print( F("</span></div>"));
+  client.print( F("<div class=\"row\"><span class=\"label\">MQTT</span><span id=\"stMqtt\" class=\"value\"><span class=\"badge "));
+  client.print( mqttNet.connected() ? F("ok") : F("err"));
+  client.print( F("\">"));
+  client.print( mqttNet.connected() ? F("已连接") : F("未连接"));
+  client.print( F("</span></span></div></div>"));
+
+  // Card 2: Screen Brightness
+  client.print( F("<div class=\"glass\"><h2>屏幕亮度</h2><div "
+            "class=\"slider-container\"><div class=\"slider-val\" id=\"bv\">"));
+  client.print( String(appliedBrightness));
+  client.print( F("%</div>"));
+  client.print( F("<input type=\"range\" id=\"br\" min=\"0\" max=\"100\" value=\""));
+  client.print( String(appliedBrightness));
+  client.print( F("\">"));
+  client.print( F("<p id=\"brHint\" "
+            "style=\"color:#8e8e93;font-size:12px;margin-top:6px\">"
+            "拖动实时应用背光</p></div></div>"));
+
+  // Card 3: Screen Layout
+  client.print( F("<div class=\"glass\" style=\"grid-column:1 / -1\"><h2>屏幕布局</h2><div class=\"segmented layout-segmented\">"));
+  String lc = stored.layout;
+  client.print( F("<button id=\"lc0\" onclick=\"setLayout('classic')\""));
+  if (lc == "classic")
+    client.print( F(" class=\"active\""));
+  client.print( F(">经典</button>"));
+  client.print( F("<button id=\"lc1\" onclick=\"setLayout('dashboard')\""));
+  if (lc == "dashboard")
+    client.print( F(" class=\"active\""));
+  client.print( F(">面板</button>"));
+  client.print( F("<button id=\"lc2\" onclick=\"setLayout('clock')\""));
+  if (lc == "clock")
+    client.print( F(" class=\"active\""));
+  client.print( F(">时钟</button>"));
+  client.print( F("</div>"));
+  client.print( F("<div class=\"label\" style=\"margin-top:14px\">屏幕旋转</div><div class=\"segmented rotation-segmented\">"));
+  uint16_t currentRotation = stored.rotation;
+  client.print( F("<button id=\"rc0\" onclick=\"setRotation(0)\""));
+  if (currentRotation == 0)
+    client.print( F(" class=\"active\""));
+  client.print( F(">0°</button>"));
+  client.print( F("<button id=\"rc90\" onclick=\"setRotation(90)\""));
+  if (currentRotation == 90)
+    client.print( F(" class=\"active\""));
+  client.print( F(">90°</button>"));
+  client.print( F("<button id=\"rc180\" onclick=\"setRotation(180)\""));
+  if (currentRotation == 180)
+    client.print( F(" class=\"active\""));
+  client.print( F(">180°</button>"));
+  client.print( F("<button id=\"rc270\" onclick=\"setRotation(270)\""));
+  if (currentRotation == 270)
+    client.print( F(" class=\"active\""));
+  client.print( F(">270°</button>"));
+  client.print( F("</div>"));
+  client.print( F("<div class=\"label\">屏幕镜像（半透半反镜用）</div><div class=\"segmented mirror-segmented\">"));
+  uint8_t currentMirror = stored.mirror;
+  client.print( F("<button id=\"mk0\" onclick=\"setMirror(0)\""));
+  if (currentMirror == 0)
+    client.print( F(" class=\"active\""));
+  client.print( F(">无</button>"));
+  client.print( F("<button id=\"mk1\" onclick=\"setMirror(1)\""));
+  if (currentMirror == 1)
+    client.print( F(" class=\"active\""));
+  client.print( F(">左右镜像</button>"));
+  client.print( F("</div></div>"));
+
+  client.print( F("<div class=\"paired-grid\">"));
+  // Card 4: Brightness Schedule
+  client.print( F(
+      "<div class=\"glass\"><h2><span>亮度定时</span><label class=\"switch\">"));
+  client.print(
+      F("<input type=\"checkbox\" id=\"bse\" onchange=\"toggleSchedule()\""));
+  if (hasSchedule)
+    client.print( F(" checked"));
+  client.print( F("><span class=\"slider-round\"></span></label></h2>"));
+
+  client.print( F("<div id=\"schedFields\""));
+  if (!hasSchedule)
+    client.print( F(" style=\"display:none\""));
+  client.print( F("><div class=\"slot-box\">"));
+
+  // Night Slot 0
+  client.print( F("<div class=\"slot-row\"><span class=\"label\">夜间段</span><div>"));
+  client.print( F("<input type=\"time\" id=\"s0s\" value=\"22:00\"><span "
+            "style=\"color:#8e8e93;margin:0 4px\">~</span>"));
+  client.print( F("<input type=\"time\" id=\"s0e\" value=\"06:00\"></div></div>"));
+  client.print( F("<div class=\"slot-row\"><span class=\"label\">夜间亮度</span>"));
+  client.print(
+      F("<div style=\"display:flex;align-items:center;gap:8px;width:60%\">"));
+  client.print( F("<input type=\"range\" id=\"s0b\" min=\"0\" max=\"100\" "
+            "value=\"20\"><span id=\"s0bv\" "
+            "style=\"color:#0a84ff;font-weight:600;min-width:32px;text-align:"
+            "right\">20%</span></div></div></div>"));
+
+  // Day Slot 1
+  client.print( F("<div class=\"slot-box\"><div class=\"slot-row\"><span "
+            "class=\"label\">日间段</span><div>"));
+  client.print( F("<input type=\"time\" id=\"s1s\" value=\"06:00\"><span "
+            "style=\"color:#8e8e93;margin:0 4px\">~</span>"));
+  client.print( F("<input type=\"time\" id=\"s1e\" value=\"22:00\"></div></div>"));
+  client.print( F("<div class=\"slot-row\"><span class=\"label\">日间亮度</span>"));
+  client.print(
+      F("<div style=\"display:flex;align-items:center;gap:8px;width:60%\">"));
+  client.print( F("<input type=\"range\" id=\"s1b\" min=\"0\" max=\"100\" "
+            "value=\"100\"><span id=\"s1bv\" "
+            "style=\"color:#0a84ff;font-weight:600;min-width:32px;text-align:"
+            "right\">100%</span></div></div></div>"));
+
+  client.print( F("<button class=\"btn-primary\" "
+            "onclick=\"saveSchedule(true)\">保存并推送到设备</button>"));
+  client.print( F("</div></div>"));
+
+  // Card 5: Real-time Debug Status
+  client.print( F("<div class=\"glass debug-card\"><h2><span>实时调试数据</span>"));
+  client.print( F("<button class=\"btn-action\" onclick=\"toggleJson(this)\">查看 "
+            "JSON</button></h2><pre id=\"log\"></pre></div>"));
+  client.print( F("</div>"));
+
+  client.print(
+      F("</div></div><div id=\"toast\" class=\"toast\"></div>")); // end grid,
+                                                                 // container,
+                                                                 // toast
+
+  // JavaScript
+  client.print( F("<script>\n"));
+  // ---- i18n: 中文原文为 key，英文为译文（与桌面配置工具同一套写法）----
+  client.print(F("/* ---------- i18n ---------- */\n"));
+  client.print(F("const I18N={'固件:':'Firmware:','打印机实时状态':'Printer live status',"
+    "'离线':'Offline','打印中':'Printing','准备中':'Preparing','已暂停':'Paused',"
+    "'已完成':'Done','待机':'Standby','异常中断':'Failed','待机中':'Idle','空闲':'Standby',"
+    "'任务进度':'Progress','即将完成':'Finishing soon',"
+    "'⏱ 剩余时间':'⏱\\uFE0F Time left','📑 打印层数':'📑\\uFE0F Layers',"
+    "'🌡 喷嘴温度':'🌡\\uFE0F Nozzle temp','🛏 热床温度':'🛏\\uFE0F Bed temp',"
+    "'📦 机箱温度':'📦\\uFE0F Chamber temp','⚡ 打印速度':'⚡\\uFE0F Speed',"
+    "'🧵 耗材状态':'🧵\\uFE0F Filament status',"
+    "'静音 (50%)':'Silent (50%)','标准 (100%)':'Standard (100%)',"
+    "'运动 (124%)':'Sport (124%)','狂暴 (166%)':'Ludicrous (166%)',"
+    "'静音':'Silent','标准':'Standard','运动':'Sport','狂暴':'Ludicrous',"
+    "'设备状态':'Device status','打印机':'Printer','未选择':'Not selected','机型':'Model',"
+    "'状态':'Status','已连接':'Connected','未连接':'Disconnected',"
+    "'屏幕亮度':'Brightness','拖动实时应用背光':'Drag to apply the backlight live',"
+    "'显示目前屏幕实时亮度（已启用定时规则）':'Shows the current screen brightness (schedule rule on)',"
+    "'屏幕布局':'Screen layout','经典':'Classic','面板':'Dashboard','时钟':'Clock',"
+    "'屏幕旋转':'Rotation','屏幕镜像（半透半反镜用）':'Mirror (for half-mirror builds)',"
+    "'无':'Off','左右镜像':'Left-right mirror',"
+    "'亮度定时':'Brightness schedule','夜间段':'Night slot','夜间亮度':'Night brightness',"
+    "'日间段':'Day slot','日间亮度':'Day brightness',"
+    "'保存并推送到设备':'Save and push to device',"
+    "'实时调试数据':'Live debug data','查看 JSON':'Show JSON','隐藏 JSON':'Hide JSON',"
+    "'🔧 当前动作':'🔧 Current action','轮询中':'Polling',"
+    "'槽位':'Slot ','外挂':'External','空':'Empty',"
+    "'✅ 定时已关闭并即时生效':'✅ Schedule turned off and applied immediately',"
+    "'✅ 已保存并即时推送到设备！':'✅ Saved and pushed to the device!'};\n"));
+  client.print(F("function norm(s){var SP=String.fromCharCode(32,9,13,10);var out='';"
+    "var prev=false;for(var i=0;i<s.length;i++){var c=s.charAt(i);"
+    "if(c==='\\uFE0F')continue;if(SP.indexOf(c)>=0){if(!prev){out+=' ';prev=true;}}"
+    "else{out+=c;prev=false;}}return out.trim();}\n"
+    "for(const k in I18N){const nk=norm(k);if(nk!==k){I18N[nk]=I18N[k];delete I18N[k];}}\n"
+    "const REV={};for(const k in I18N){const v=norm(I18N[k]);if(!REV[v])REV[v]=k;}\n"
+    "let LANG=(function(){try{var s=localStorage.getItem('psLang');if(s==='zh'||s==='en')return s;}catch(e){}"
+    "return ((navigator.language||'').toLowerCase().indexOf('en')===0)?'en':'zh';})();\n"
+    "function t(s){if(LANG==='zh'||!s)return s;return I18N[norm(s)]||s;}\n"));
+  client.print(F("function trNode(node){if(!node||node.nodeType!==3)return;var raw=node.nodeValue;if(!raw)return;"
+    "var core=norm(raw);if(!core)return;var next=(LANG==='en')?I18N[core]:REV[core];if(!next)return;"
+    "var SP=String.fromCharCode(32,9,13,10);var a=0,b=raw.length;"
+    "while(a<b&&SP.indexOf(raw.charAt(a))>=0)a++;while(b>a&&SP.indexOf(raw.charAt(b-1))>=0)b--;"
+    "var out=raw.slice(0,a)+next+raw.slice(b);if(out!==raw)node.nodeValue=out;}\n"
+    "function fixMixedText(){var sub=document.querySelector('.header .sub');"
+    "if(sub&&sub.firstChild&&sub.firstChild.nodeType===3){var v=sub.firstChild.nodeValue;"
+    "if(LANG==='en'){if(v.indexOf('固件:')===0)sub.firstChild.nodeValue='Firmware:'+v.slice(3);}"
+    "else{if(v.indexOf('Firmware:')===0)sub.firstChild.nodeValue='固件:'+v.slice(9);}}"
+    "var rem=document.getElementById('pRemain');"
+    "if(rem&&LANG==='en'){var s=rem.textContent;"
+    "s=s.replace(/([0-9]+)\\s*小时\\s*/g,'$1h ').replace(/([0-9]+)分钟/g,'$1min')"
+    ".replace(/([0-9]+)分/g,'$1m');if(s!==rem.textContent)rem.textContent=s;}}\n"
+    "function applyDom(root){var scope=root&&root.nodeType===1?root:document.body;"
+    "var w=document.createTreeWalker(scope,NodeFilter.SHOW_TEXT,null);var n;"
+    "while((n=w.nextNode()))trNode(n);fixMixedText();}\n"));
+  client.print(F("function renderLangBtns(){['langZh','langEn'].forEach(function(id){var el=document.getElementById(id);"
+    "if(el)el.className=(id===(LANG==='en'?'langEn':'langZh'))?'active':'';});}\n"
+    "/* 把网页语言同步到设备：屏幕右上角据此显示英文缩写或中文点阵字 */\n"
+    "function pushLangToDevice(l){try{"
+    "fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lang:l})})"
+    ".catch(function(){});}catch(e){}}\n"
+    "function syncJsonBtn(){var b=document.querySelector('.debug-card .btn-action'),l=document.getElementById('log');"
+    "if(!b||!l)return;b.textContent=(l.style.display==='block')?t('隐藏 JSON'):t('查看 JSON');}\n"
+    "function setLang(l){LANG=(l==='en')?'en':'zh';try{localStorage.setItem('psLang',LANG);}catch(e){}"
+    "document.documentElement.lang=(LANG==='en')?'en':'zh-CN';renderLangBtns();applyDom(document.body);"
+    "if(lastData)renderStatus(lastData);else refreshStatus();updateManualBrightnessState();syncJsonBtn();"
+    "pushLangToDevice(LANG);}\n"
+    "function initLang(){document.documentElement.lang=(LANG==='en')?'en':'zh-CN';"
+    "renderLangBtns();applyDom(document.body);}\n"
+    "const mo=new MutationObserver(function(muts){if(LANG!=='en')return;"
+    "for(var i=0;i<muts.length;i++){var m=muts[i];"
+    "if(m.type==='characterData'){trNode(m.target);}else{"
+    "for(var j=0;j<m.addedNodes.length;j++){var nd=m.addedNodes[j];"
+    "if(nd.nodeType===3)trNode(nd);else if(nd.nodeType===1)applyDom(nd);}}}});\n"
+    "mo.observe(document.body,{childList:true,subtree:true,characterData:true});\n"));
+  client.print(F("const savedSchedule = "));
+  {
+    String sched = stored.brightnessSchedule;
+    sched.trim();
+    if (!sched.startsWith("[") || !sched.endsWith("]")) {
+      sched = "[]";
+    }
+    client.print(sched);
+  }
+  client.print(F(";\n"));
+  client.print( F("function showToast(msg){\n"));
+  client.print( F("  let t=document.getElementById('toast');if(!t)return;\n"));
+  client.print( F("  t.textContent=msg;t.classList.add('show');\n"));
+  client.print( F("  setTimeout(()=>t.classList.remove('show'),2500);\n"));
+  client.print( F("}\n"));
+  client.print( F("function updateManualBrightnessState(){\n"));
+  client.print( F("  var c=document.getElementById('bse'), "
+            "hint=document.getElementById('brHint');\n"));
+  client.print( F("  if(!hint)return;\n"));
+  client.print( F("  if(c&&c.checked){\n"));
+  client.print( F("    hint.textContent=t('显示目前屏幕实时亮度（已启用定时规则）');\n"));
+  client.print( F("  }else{\n"));
+  client.print( F("    hint.textContent=t('拖动实时应用背光');\n"));
+  client.print( F("  }\n"));
+  client.print( F("}\n"));
+  client.print( F("function initScheduleUI(){\n"));
+  client.print( F("  if(Array.isArray(savedSchedule) && savedSchedule.length>0){\n"));
+  client.print( F("    for(let i=0;i<Math.min(savedSchedule.length,2);i++){\n"));
+  client.print( F("      let s=savedSchedule[i];\n"));
+  client.print( F("      if(s.sh!==undefined){\n"));
+  client.print(
+      F("        let st=(s.sh<10?'0':'')+s.sh+':'+(s.sm<10?'0':'')+s.sm;\n"));
+  client.print(
+      F("        let et=(s.eh<10?'0':'')+s.eh+':'+(s.em<10?'0':'')+s.em;\n"));
+  client.print( F("        let elS=document.getElementById('s'+i+'s'), "
+            "elE=document.getElementById('s'+i+'e'), "
+            "elB=document.getElementById('s'+i+'b'), "
+            "elBv=document.getElementById('s'+i+'bv');\n"));
+  client.print( F("        if(elS)elS.value=st; if(elE)elE.value=et;\n"));
+  client.print( F("        if(elB && s.b!==undefined){elB.value=s.b; "
+            "if(elBv)elBv.textContent=s.b+'%';}\n"));
+  client.print( F("      }\n"));
+  client.print( F("    }\n"));
+  client.print( F("  }\n"));
+  client.print( F("  updateManualBrightnessState();\n"));
+  client.print( F("}\n"));
+  client.print( F("window.addEventListener('DOMContentLoaded', function(){initLang();initScheduleUI();refreshStatus();});\n"));
+
+  client.print(
+      F("function fmtSt(st,prg,on){\n"
+        "  if(!on)return{t:t('离线'),c:'badge muted'};\n"
+        "  st=(st||'').toLowerCase();\n"
+        "  if(st==='running'||st==='printing')return{t:t('打印中'),c:'badge ok'};\n"
+        "  if(st==='prepare'||st==='preparing'||st==='heatbed'||st==='homing')return{t:t('准备中'),c:'badge info'};\n"
+        "  if(st==='pause'||st==='paused')return{t:t('已暂停'),c:'badge warn'};\n"
+        "  if(st==='finish'||st==='finished'||st==='done'||prg>=100)return{t:t('已完成'),c:'badge ok'};\n"
+        "  if(st==='failed'||st==='error')return{t:t('异常中断'),c:'badge err'};\n"
+        "  if(st==='idle')return{t:t('待机中'),c:'badge muted'};\n"
+        "  return{t:st?st.toUpperCase():t('空闲'),c:'badge muted'};\n"
+        "}\n"
+        "function fmtSpd(lvl,mag){\n"
+        "  var n=t('标准');\n"
+        "  if(lvl===1)n=t('静音');else if(lvl===3)n=t('运动');else if(lvl===4)n=t('狂暴');\n"
+        "  return mag>0?n+' ('+mag+'%)':n;\n"
+        "}\n"
+        "function fmtRem(m,st,prg){\n"
+        "  if(st==='finish'||prg>=100)return t('已完成');\n"
+        "  if(m===undefined||m<0)return '--';\n"
+        "  if(m===0)return t('即将完成');\n"
+        "  var h=Math.floor(m/60),rm=m%60;\n"
+        "  if(LANG==='en')return h>0?(h+'h '+rm+'m'):(rm+'min');\n"
+        "  return h>0?(h+'小时 '+rm+'分'):(rm+'分钟');\n"
+        "}\n"
+        "function hasChamber(m){\n"
+        "  m=(m||'').toUpperCase().replace(/[^A-Z0-9]/g,'');\n"
+        "  return m!=='P1S'&&m!=='P1P'&&m!=='A1'&&m!=='A1MINI';\n"
+        "}\n"
+        "function updatePrinterUI(d){\n"
+        "  var sb=document.getElementById('pStatusBadge');\n"
+        "  var si=fmtSt(d.status,d.progress,d.online!==false);\n"
+        "  if(sb){sb.className=si.c;sb.textContent=si.t;}\n"
+        "  var pv=document.getElementById('pProgressVal'),pb=document.getElementById('pProgressBar');\n"
+        "  if(d.progress!==undefined&&d.progress>=0){\n"
+        "    if(pv)pv.textContent=Math.round(d.progress)+'%';\n"
+        "    if(pb)pb.style.width=Math.min(100,Math.max(0,d.progress))+'%';\n"
+        "  }else{\n"
+        "    if(pv)pv.textContent=(d.status==='finish'?'100%':'--');\n"
+        "    if(pb)pb.style.width=(d.status==='finish'?'100%':'0%');\n"
+        "  }\n"
+        "  var pr=document.getElementById('pRemain');if(pr)pr.textContent=fmtRem(d.remaining_min,d.status,d.progress);\n"
+        "  var pl=document.getElementById('pLayer');\n"
+        "  if(pl){\n"
+        "    if(d.current_layer!==undefined&&d.current_layer>=0){\n"
+        "      pl.textContent=(d.total_layers>0)?(d.current_layer+' / '+d.total_layers):String(d.current_layer);\n"
+        "    }else{pl.textContent='--';}\n"
+        "  }\n"
+        "  var pn=document.getElementById('pNozzle');\n"
+        "  if(pn){\n"
+        "    if(d.dual_nozzle){\n"
+        "      pn.textContent=(d.left_nozzle_temp>0?d.left_nozzle_temp.toFixed(1):'--')+' / '+(d.right_nozzle_temp>0?d.right_nozzle_temp.toFixed(1):'--')+' ℃';\n"
+        "    }else if(d.nozzle_temp!==undefined&&d.nozzle_temp>0){\n"
+        "      pn.textContent=Number(d.nozzle_temp).toFixed(1)+' ℃';\n"
+        "    }else{pn.textContent='-- ℃';}\n"
+        "  }\n"
+        "  var pt=document.getElementById('pBed');\n"
+        "  if(pt)pt.textContent=(d.bed_temp!==undefined&&d.bed_temp>0)?(Number(d.bed_temp).toFixed(1)+' ℃'):'-- ℃';\n"
+        "  var pc=document.getElementById('pChamber');\n"
+        "  if(pc){\n"
+        "    if(d.has_chamber_sensor===false||(d.model&&!hasChamber(d.model))){\n"
+        "      pc.textContent='N/A';\n"
+        "    }else if(d.chamber_temp!==undefined&&d.chamber_temp>0){\n"
+        "      pc.textContent=Number(d.chamber_temp).toFixed(1)+' ℃';\n"
+        "    }else{\n"
+        "      pc.textContent='--';\n"
+        "    }\n"
+        "  }\n"
+        "  var ps=document.getElementById('pSpeed');\n"
+        "  if(ps)ps.textContent=(d.spd_lvl!==undefined&&d.spd_lvl>0)?fmtSpd(d.spd_lvl,d.spd_mag):'--';\n"
+        "  var sg=document.getElementById('pStage');\n"
+        "  var dtAct=(LANG==='zh')?(d.stage_cn||''):(d.stage_text||'');\n"
+        "  if(sg)sg.textContent=dtAct?dtAct:si.t;\n"
+        "  var scState=document.getElementById('pCodeState');\n"
+        "  if(scState)scState.textContent='gcode_state='+(d.status||'--');\n"
+        "  var scStage=document.getElementById('pCodeStage');\n"
+        "  var nStage=(d.stage_cur===undefined||d.stage_cur===null)?null:d.stage_cur;\n"
+        "  if(scStage)scStage.textContent='stg_cur='+(nStage===null?'--':nStage);\n"
+        "  var scNote=document.getElementById('pStageNote');\n"
+        "  if(scNote){\n"
+        "    var zh=(LANG==='zh'),cn=d.stage_cn||'',en=d.stage_text||'',note;\n"
+        "    if(cn||en){note=zh?('正在'+cn.replace(/中$/,'')):('Doing: '+en);}\n"
+        "    else if(nStage===0){note=zh?'正常打印中（stg_cur 0 = printing）':'Printing normally (stg_cur 0 = printing)';}\n"
+        "    else if(nStage!==null&&nStage>0&&nStage<=77){note=zh?('stg_cur '+nStage+' 未收录标签，按通用状态显示'):('stg_cur '+nStage+' not mapped; generic state shown');}\n"
+        "    else{note=zh?('无细分动作（stg_cur '+(nStage===null?'--':nStage)+'），显示通用状态'):('No detailed stage (stg_cur '+(nStage===null?'--':nStage)+'); generic state shown');}\n"
+        "    scNote.textContent=note;\n"
+        "  }\n"
+        "  if(!langSynced&&d.lang!==undefined){langSynced=true;if(d.lang!==LANG)pushLangToDevice(LANG);}\n"
+        "  var amsHtml='';\n"
+        "  if(d.ams&&Array.isArray(d.ams)){\n"
+        "    d.ams.forEach(function(s){\n"
+        "      var cls='ams-pill'+(s.active?' active':'');\n"
+        "      var tag='AMS'+(s.id+1);\n"
+        "      if(!s.valid){\n"
+        "        amsHtml+='<div class=\"'+cls+'\">'+\n"
+        "          '<span class=\"ams-dot\" style=\"background:#3a3a3c\"></span>'+\n"
+        "          '<span style=\"color:#8e8e93;font-weight:600\">'+tag+'</span>'+\n"
+        "          '<span style=\"color:#8e8e93\">'+t('空')+'</span>'+\n"
+        "          '</div>';\n"
+        "        return;\n"
+        "      }\n"
+        "      var rem=(s.official&&s.remain>=0&&s.remain<=100)?(' '+s.remain+'%'):'';\n"
+        "      amsHtml+='<div class=\"'+cls+'\">'+\n"
+        "        '<span class=\"ams-dot\" style=\"background:'+(s.color||'#fff')+'\"></span>'+\n"
+        "        '<span style=\"color:#8e8e93;font-weight:600\">'+tag+'</span>'+\n"
+        "        '<span style=\"color:#fff;font-weight:600\">'+(s.type||t('空'))+'</span>'+\n"
+        "        (rem?'<span style=\"color:#8e8e93\">'+rem+'</span>':'')+\n"
+        "        '</div>';\n"
+        "    });\n"
+        "  }\n"
+        "  if(d.ext){\n"
+        "    var clsExt='ams-pill'+(d.ext.active?' active':'');\n"
+        "    var remExt=(d.ext.official&&d.ext.remain>=0&&d.ext.remain<=100)?(' '+d.ext.remain+'%'):'';\n"
+        "    amsHtml+='<div class=\"'+clsExt+'\">'+\n"
+        "      '<span class=\"ams-dot\" style=\"background:'+(d.ext.color||'#fff')+'\"></span>'+\n"
+        "      '<span style=\"color:#fff;font-weight:600\">'+t('外挂')+' '+(d.ext.type||'')+'</span>'+\n"
+        "      (remExt?'<span style=\"color:#8e8e93\">'+remExt+'</span>':'')+\n"
+        "      '</div>';\n"
+        "  }\n"
+        "  var ab=document.getElementById('pAmsBox'),as=document.getElementById('pAmsSlots');\n"
+        "  if(ab&&as){\n"
+        "    if(amsHtml){as.innerHTML=amsHtml;ab.style.display='block';}else{ab.style.display='none';}\n"
+        "  }\n"
+        "}\n"
+        "let lastData=null;\n"
+        "let langSynced=false;\n"
+        "function renderStatus(d){\n"
+        "  lastData=d;\n"
+        "    let l=document.getElementById('log');if(l&&l.style.display==='block')l.textContent=JSON.stringify(d,null,2);\n"
+        "    if(d.brightness!==undefined){\n"
+        "      var br=document.getElementById('br'),bv=document.getElementById('bv');\n"
+        "      if(br&&document.activeElement!==br)br.value=d.brightness;\n"
+        "      if(bv)bv.textContent=d.brightness+'%';\n"
+        "    }\n"
+        "    if(d.name){var p=document.getElementById('stPrinter');if(p)p.textContent=d.name;}\n"
+        "    if(d.model){var m=document.getElementById('stModel');if(m)m.textContent=d.model;}\n"
+        "    if(d.status!==undefined){\n"
+        "      var st=document.getElementById('stStatus');\n"
+        "      if(st){\n"
+        "        var txt=d.status;\n"
+        "        if(d.progress>=0)txt+=' ('+d.progress+'%)';\n"
+        "        st.textContent=txt;\n"
+        "      }\n"
+        "    }\n"
+        "    if(d.mqtt_connected!==undefined){\n"
+        "      var mq=document.getElementById('stMqtt');\n"
+        "      if(mq)mq.innerHTML=d.mqtt_connected?'<span class=\"badge ok\">'+t('已连接')+'</span>':'<span class=\"badge err\">'+t('未连接')+'</span>';\n"
+        "    }\n"
+        "    if(d.layout){\n"
+        "      var idx=['classic','dashboard','clock'].indexOf(d.layout);\n"
+        "      if(idx>=0){\n"
+        "        document.querySelectorAll('.layout-segmented button').forEach(b=>b.classList.remove('active'));\n"
+        "        var btn=document.getElementById('lc'+idx);if(btn)btn.classList.add('active');\n"
+        "      }\n"
+        "    }\n"
+        "    if(d.rotation!==undefined){\n"
+        "      var rotation=Number(d.rotation);\n"
+        "      document.querySelectorAll('.rotation-segmented button').forEach(b=>b.classList.remove('active'));\n"
+        "      var rotationBtn=document.getElementById('rc'+rotation);if(rotationBtn)rotationBtn.classList.add('active');\n"
+        "    }\n"
+        "    if(d.mirror!==undefined){\n"
+        "      var mirror=Number(d.mirror);\n"
+        "      document.querySelectorAll('.mirror-segmented button').forEach(b=>b.classList.remove('active'));\n"
+        "      var mirrorBtn=document.getElementById('mk'+mirror);if(mirrorBtn)mirrorBtn.classList.add('active');\n"
+        "    }\n"
+        "    updatePrinterUI(d);\n"
+        "}\n"
+        "function refreshStatus(){\n"
+        "  fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(renderStatus).catch(e=>{});\n"
+        "}\n"
+        "setInterval(function(){if(!document.hidden)refreshStatus();},5000);\n"));
+  client.print(
+      F("function toggleJson(btn){const "
+        "el=document.getElementById('log');if(el.style.display==='none'||!el."
+        "style.display){el.style.display='block';refreshStatus();btn."
+        "textContent=t('隐藏 JSON')"
+        "}else{el.style.display='none';btn.textContent=t('查看 JSON')}}\n"));
+  client.print( F("function postConfig(data){\n"
+                  "  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})\n"
+                  "  .then(r=>r.json()).then(d=>{if(d&&d.ok)refreshStatus();})\n"
+                  "  .catch(e=>console.error(e));\n"
+                  "}\n"));
+  client.print( F("let "
+            "brt=document.getElementById('br');if(brt){brt.addEventListener('"
+            "input',function(){document.getElementById('bv').textContent=this."
+            "value+'%';});brt.addEventListener('change',function(){postConfig({"
+            "brightness:parseInt(this.value)});});}\n"));
+  client.print( F("function setLayout(v){document.querySelectorAll('.layout-segmented "
+            "button').forEach(b=>b.classList.remove('active'));const "
+            "idx=['classic','dashboard','clock'].indexOf(v);if(idx>=0)document."
+            "getElementById('lc'+idx).classList.add('active');postConfig({"
+            "layout:v});}\n"));
+  client.print( F("function setRotation(v){document.querySelectorAll('.rotation-segmented "
+            "button').forEach(b=>b.classList.remove('active'));const "
+            "btn=document.getElementById('rc'+v);if(btn)btn.classList.add('active');"
+            "postConfig({rotation:Number(v)});}\n"));
+  client.print( F("function setMirror(v){document.querySelectorAll('.mirror-segmented "
+            "button').forEach(b=>b.classList.remove('active'));const "
+            "btn=document.getElementById('mk'+v);if(btn)btn.classList.add('active');"
+            "postConfig({mirror:Number(v)});}\n"));
+  client.print( F("function toggleSchedule(){var "
+            "e=document.getElementById('schedFields'),c=document."
+            "getElementById('bse');e.style.display=c.checked?'block':'none';"
+            "updateManualBrightnessState();saveSchedule(false);}\n"));
+  client.print( F("function saveSchedule(notify){\n"));
+  client.print( F("  var s=document.getElementById('bse');\n"));
+  client.print( F("  if(!s.checked){\n"));
+  client.print( F("    postConfig({brightness_schedule:''});\n"));
+  client.print( F("    if(notify) showToast(t('✅ 定时已关闭并即时生效'));\n"));
+  client.print( F("    return;\n"));
+  client.print( F("  }\n"));
+  client.print( F("  var slots=[];\n"));
+  client.print( F("  for(var i=0;i<2;i++){\n"));
+  client.print( F("    var "
+            "st=document.getElementById('s'+i+'s').value,et=document."
+            "getElementById('s'+i+'e').value,b=parseInt(document."
+            "getElementById('s'+i+'b').value);\n"));
+  client.print( F("    if(st&&et){\n"));
+  client.print( F("      var "
+            "sh=parseInt(st.split(':')[0]),sm=parseInt(st.split(':')[1]),eh="
+            "parseInt(et.split(':')[0]),em=parseInt(et.split(':')[1]);\n"));
+  client.print( F("      slots.push({sh:sh,sm:sm,eh:eh,em:em,b:b});\n"));
+  client.print( F("    }\n"));
+  client.print( F("  }\n"));
+  client.print( F("  postConfig({brightness_schedule:JSON.stringify(slots)});\n"));
+  client.print( F("  if(notify) showToast(t('✅ 已保存并即时推送到设备！'));\n"));
+  client.print( F("}\n"));
+  client.print( F("document.querySelectorAll('#schedFields "
+            "input').forEach(function(el){\n"));
+  client.print( F("  if(el.type==='range'){\n"));
+  client.print( F("    "
+            "el.addEventListener('input',function(){document.getElementById("
+            "this.id+'v').textContent=this.value+'%';});\n"));
+  client.print( F("  }\n"));
+  client.print( F("});\n"));
+  client.print( F("</script></body></html>"));
+
+  client.finish();
+  realClient.stop(100);
+}
+
+// ---------------------------------------------------------------------------
+// Display orientation = rotation + optional mirror (beam-splitter builds).
+// A panel viewed through a 45 degree half mirror (HoloCubic style) shows a
+// mirror image, which no rotation value can undo, so the MX MADCTL bit has
+// to be toggled. TFT_eSPI's ST7789 driver only implements rotations 0-3
+// (TFT_Drivers/ST7789_2_Rotation.h uses "rotation = m % 4"), unlike the
+// ILI9341 driver which has mirrored 4-7 cases, so MADCTL is written here again
+// on top of setRotation(). colstart/rowstart and the window size stay as
+// computed by setRotation(), only the scan direction changes.
+static const uint8_t kMadctlBase[4] = {
+    TFT_MAD_COLOR_ORDER,
+    TFT_MAD_MX | TFT_MAD_MV | TFT_MAD_COLOR_ORDER,
+    TFT_MAD_MX | TFT_MAD_MY | TFT_MAD_COLOR_ORDER,
+    TFT_MAD_MV | TFT_MAD_MY | TFT_MAD_COLOR_ORDER,
+};
+
+void applyDisplayOrientation() {
+  uint8_t index = (uint8_t)((stored.rotation / 90) & 0x03);
+  tft.setRotation(index);
+  if (stored.mirror == 0)
+    return;
+  uint8_t madctl = kMadctlBase[index];
+  madctl ^= TFT_MAD_MX; // left/right mirror
+  tft.writecommand(TFT_MADCTL);
+  tft.writedata(madctl);
+}
+
+String applyConfigBody(const String &body, int &statusCode) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    statusCode = 400;
+    return "{\"ok\":false,\"error\":\"bad json\"}";
+  }
+
+  const char *region = doc["region"] | "";
+  const char *wifiSsid = doc["wifi_ssid"] | "";
+  const char *wifiPassword = doc["wifi_password"] | "";
+  const char *mqttHost = doc["mqtt_host"] | "";
+  const char *mqttUsername = doc["mqtt_username"] | "";
+  const char *token = doc["token"] | doc["access_token"] | "";
+  const char *serial = doc["serial"] | doc["printer_serial"] | "";
+  const char *name = doc["name"] | doc["display_name"] | "";
+  const char *model = doc["model"] | doc["printer_model"] | "";
+  const char *alias = doc["alias"] | doc["display_alias"] | "";
+  const char *layout = doc["layout"] | doc["display_layout"] | "";
+  int requestedRotation = -1;
+  if (doc["rotation"].is<int>() || doc["rotation"].is<unsigned int>())
+    requestedRotation = doc["rotation"].as<int>();
+  else if (doc["rotation"].is<const char *>())
+    requestedRotation = atoi(doc["rotation"].as<const char *>());
+  else if (doc["display_rotation"].is<int>() || doc["display_rotation"].is<unsigned int>())
+    requestedRotation = doc["display_rotation"].as<int>();
+  else if (doc["display_rotation"].is<const char *>())
+    requestedRotation = atoi(doc["display_rotation"].as<const char *>());
+  int requestedMirror = -1;
+  if (doc["mirror"].is<int>() || doc["mirror"].is<unsigned int>())
+    requestedMirror = doc["mirror"].as<int>();
+  else if (doc["mirror"].is<const char *>())
+    requestedMirror = atoi(doc["mirror"].as<const char *>());
+  else if (doc["display_mirror"].is<int>() || doc["display_mirror"].is<unsigned int>())
+    requestedMirror = doc["display_mirror"].as<int>();
+  else if (doc["display_mirror"].is<const char *>())
+    requestedMirror = atoi(doc["display_mirror"].as<const char *>());
+  const char *aliasBitmapHex = doc["alias_bitmap_hex"] | "";
+  const char *langReq = doc["lang"] | doc["ui_lang"] | "";
+  const char *printersPayload = doc["printers_json"] | "";
+  int requestedBrightness = doc["brightness"] | doc["brightness_percent"] | -1;
+  bool wifiChanged = false;
+  bool mqttChanged = false;
+  bool brightnessChanged = false;
+
+  if (printersPayload[0]) {
+    JsonDocument printersDoc;
+    if (!deserializeJson(printersDoc, printersPayload)) {
+      JsonArray arr = printersDoc.is<JsonArray>()
+                          ? printersDoc.as<JsonArray>()
+                          : printersDoc["printers"].as<JsonArray>();
+      if (loadPrinterArray(arr))
+        savePrinterOptions();
+    }
+  }
+  if (doc["printers"].is<JsonArray>()) {
+    if (loadPrinterArray(doc["printers"].as<JsonArray>()))
+      savePrinterOptions();
+  }
+  if (wifiSsid[0] && stored.wifiSsid != wifiSsid) {
+    stored.wifiSsid = wifiSsid;
+    wifiChanged = true;
+  }
+  if (wifiPassword[0] && stored.wifiPassword != wifiPassword) {
+    stored.wifiPassword = wifiPassword;
+    wifiChanged = true;
+  }
+  if (region[0])
+    stored.region = region;
+  if (mqttHost[0] && stored.mqttHost != mqttHost) {
+    stored.mqttHost = mqttHost;
+    mqttChanged = true;
+  }
+  if (mqttUsername[0] && stored.mqttUsername != mqttUsername) {
+    stored.mqttUsername = mqttUsername;
+    mqttChanged = true;
+  }
+  if (token[0] && stored.token != token) {
+    stored.token = token;
+    mqttChanged = true;
+  }
+  if (serial[0]) {
+    if (stored.serial != serial) {
+      stored.serial = serial;
+      pr.serial = serial;
+      cache.baseDrawn = false;
+      pr.progress = -1;
+      pr.nozzleTemp = -1;
+      pr.leftNozzleTemp = -1;
+      pr.rightNozzleTemp = -1;
+      pr.dualNozzle = false;
+      pr.bedTemp = -1;
+      pr.chamberTemp = -1;
+      pr.remainingMin = -1;
+      pr.currentLayer = -1;
+      pr.totalLayers = -1;
+      pr.status = "prepare";
+      printerStatusReceived = false;
+      pr.online = false;
+      mqttChanged = true;
+    } else {
+      pr.serial = serial;
+    }
+  }
+  if (name[0]) {
+    stored.name = name;
+    pr.displayName = name;
+    cache.baseDrawn = false;
+  }
+  if (model[0]) {
+    stored.model = model;
+    pr.model = model;
+    cache.baseDrawn = false;
+  }
+  if (alias[0] || doc["alias"].is<const char *>() ||
+      doc["display_alias"].is<const char *>()) {
+    stored.alias = alias;
+    cache.baseDrawn = false;
+  }
+  bool layoutChanged = false;
+  bool rotationChanged = false;
+  bool mirrorChanged = false;
+  bool langChanged = false;
+  if (langReq[0]) {
+    String nextLang = langReq;
+    nextLang.toLowerCase();
+    nextLang = (nextLang == "zh") ? "zh" : "en";
+    if (stored.uiLang != nextLang) {
+      stored.uiLang = nextLang;
+      langChanged = true;
+      // 只影响右上角状态文字的绘制，清掉脏检查键即可触发局部重绘
+      cache.status = "";
+      cache.clockStatus = "";
+      cache.dashStatus = "";
+    }
+  }
+  if (layout[0]) {
+    String nextLayout = layout;
+    nextLayout.toLowerCase();
+    nextLayout = nextLayout == "dashboard" ? "dashboard"
+                 : nextLayout == "clock"   ? "clock"
+                                           : "classic";
+    if (stored.layout != nextLayout) {
+      stored.layout = nextLayout;
+      layoutChanged = true;
+      cache.baseDrawn = false;
+    }
+  }
+  if (requestedRotation >= 0) {
+    uint16_t nextRotation = (requestedRotation == 90 || requestedRotation == 180 ||
+                                 requestedRotation == 270)
+                                ? (uint16_t)requestedRotation
+                                : 0;
+    if (stored.rotation != nextRotation) {
+      stored.rotation = nextRotation;
+      rotationChanged = true;
+      cache = RenderCache();
+    }
+  }
+  if (requestedMirror >= 0) {
+    uint8_t nextMirror = (requestedMirror == 1) ? (uint8_t)requestedMirror : 0;
+    if (stored.mirror != nextMirror) {
+      stored.mirror = nextMirror;
+      mirrorChanged = true;
+      cache = RenderCache();
+    }
+  }
+  if (aliasBitmapHex[0] || doc["alias_bitmap_hex"].is<const char *>()) {
+    stored.aliasBitmapHex = aliasBitmapHex;
+    stored.aliasBitmapW = doc["alias_bitmap_w"] | 0;
+    stored.aliasBitmapH = doc["alias_bitmap_h"] | 0;
+    cache.baseDrawn = false;
+  }
+
+  bool scheduleChanged = false;
+  if (doc["brightness_schedule"].is<const char *>() ||
+      doc["brightness_schedule"].is<JsonVariant>()) {
+    stored.brightnessSchedule = doc["brightness_schedule"].as<String>();
+    scheduleChanged = true;
+  }
+
+  if (requestedBrightness >= 0) {
+    uint8_t normalized = normalizeBrightness(requestedBrightness);
+    if (stored.brightness != normalized) {
+      stored.brightness = normalized;
+      brightnessChanged = true;
+    }
+  }
+  bool orientationChanged = rotationChanged || mirrorChanged;
+  bool anyConfigChanged = wifiChanged || mqttChanged || brightnessChanged || scheduleChanged || layoutChanged || orientationChanged || langChanged;
+  bool ok = anyConfigChanged ? saveStoredConfig() : true;
+  if (orientationChanged) {
+    applyDisplayOrientation();
+    tft.fillScreen(BG_BLACK);
+  }
+  if (wifiChanged) {
+    wifiReconnectPending = true;
+  } else if (mqttChanged) {
+    mqttReconnectPending = true;
+  }
+  displayDirty = true;
+  if (brightnessChanged || scheduleChanged) {
+    applyBrightnessSchedule();
+  }
+
+  JsonDocument outDoc;
+  outDoc["ok"] = ok;
+  outDoc["serial"] = stored.serial;
+  outDoc["name"] = stored.name;
+  outDoc["ip"] = WiFi.localIP().toString();
+  outDoc["brightness"] = stored.brightness;
+  outDoc["layout"] = stored.layout;
+  outDoc["rotation"] = stored.rotation;
+  outDoc["mirror"] = stored.mirror;
+  String out;
+  serializeJson(outDoc, out);
+  statusCode = ok ? 200 : 500;
+  return out;
+}
+
+String handleSerialJson(const String &body, int &statusCode) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (!err) {
+    const char *cmd = doc["cmd"] | "";
+    if (String(cmd).equalsIgnoreCase("wifi_scan") || doc["wifi_scan"] == true) {
+      statusCode = 200;
+      return wifiScanJson();
+    }
+    if (String(cmd).equalsIgnoreCase("status")) {
+      statusCode = 200;
+      return statusJson();
+    }
+  }
+  return applyConfigBody(body, statusCode);
+}
+
+String urlDecode(const String &text) {
+  String out;
+  out.reserve(text.length());
+  for (size_t i = 0; i < text.length(); ++i) {
+    char c = text[i];
+    if (c == '+') {
+      out += ' ';
+    } else if (c == '%' && i + 2 < text.length()) {
+      char hex[3] = {text[i + 1], text[i + 2], 0};
+      out += (char)strtol(hex, nullptr, 16);
+      i += 2;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+String configBodyFromQuery(const String &query) {
+  JsonDocument doc;
+  size_t start = 0;
+  while (start < query.length()) {
+    int amp = query.indexOf('&', start);
+    if (amp < 0)
+      amp = query.length();
+    String pair = query.substring(start, amp);
+    int eq = pair.indexOf('=');
+    if (eq > 0) {
+      String key = urlDecode(pair.substring(0, eq));
+      String value = urlDecode(pair.substring(eq + 1));
+      if (key == "wifi_ssid" || key == "wifi_password" || key == "region" ||
+          key == "mqtt_host" || key == "mqtt_username" || key == "token" ||
+          key == "access_token" || key == "serial" || key == "printer_serial" ||
+          key == "name" || key == "display_name" || key == "model" ||
+          key == "printer_model" || key == "alias" || key == "display_alias" ||
+          key == "layout" || key == "display_layout" ||
+          key == "rotation" || key == "display_rotation" ||
+          key == "mirror" || key == "display_mirror" ||
+          key == "alias_bitmap_hex" || key == "alias_bitmap_w" ||
+          key == "alias_bitmap_h" || key == "printers_json" ||
+          key == "brightness" || key == "brightness_percent") {
+        doc[key] = value;
+      }
+    }
+    start = amp + 1;
+  }
+  String body;
+  serializeJson(doc, body);
+  return body;
+}
+
+void sendHttpJson(WiFiClient &client, int statusCode, const String &body) {
+  client.setNoDelay(true);
+  const char *statusText = statusCode == 200   ? "OK"
+                           : statusCode == 202 ? "Accepted"
+                           : statusCode == 204 ? "No Content"
+                           : statusCode == 400 ? "Bad Request"
+                                               : "Not Found";
+  client.printf("HTTP/1.1 %d %s\r\n"
+                "Content-Type: application/json; charset=utf-8\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n"
+                "Access-Control-Allow-Headers: content-type\r\n"
+                "Connection: close\r\n"
+                "Content-Length: %u\r\n\r\n",
+                statusCode, statusText, (unsigned)body.length());
+  if (body.length()) {
+    client.print(body);
+  }
+  client.stop(100);
+}
+
+void sendHttpHtml(WiFiClient &client, const String &body) {
+  client.print("HTTP/1.1 200 OK\r\n");
+  client.print("Content-Type: text/html; charset=utf-8\r\n");
+  client.print("Cache-Control: no-store\r\n");
+  client.print("Connection: close\r\n");
+  client.printf("Content-Length: %u\r\n\r\n", body.length());
+  client.print(body);
+  client.stop(50);
+}
+
+void queueHttpConfig(WiFiClient &client, const String &body) {
+  if (!body.length() || body.length() > 4096) {
+    sendHttpJson(client, 400, "{\"ok\":false,\"error\":\"bad config size\"}");
+    return;
+  }
+  pendingHttpConfigBody = body;
+  pendingHttpConfig = true;
+  sendHttpJson(client, 202, "{\"ok\":true,\"queued\":true}");
+}
+
+void serviceHttpClient(WiFiClient &client);
+
+void handleApiClient() {
+  if (!serverStarted)
+    return;
+
+  unsigned long now = millis();
+  for (auto &pending : pendingHttpClients) {
+    if (!pending.active)
+      continue;
+    if (!pending.client) {
+      pending.active = false;
+    } else if (!pending.client.available() &&
+               now - pending.acceptedAt >= HTTP_FIRST_BYTE_TIMEOUT_MS) {
+      pending.client.abort();
+      pending.active = false;
+    }
+  }
+
+  // Keep connections without a first HTTP byte in a small app-owned queue.
+  // They are serviced on later loop passes without blocking the main loop.
+  auto acceptPending = [](WiFiServer &server) {
+    while (server.hasClient()) {
+      int freeSlot = -1;
+      for (size_t i = 0; i < MAX_PENDING_HTTP_CLIENTS; ++i) {
+        if (!pendingHttpClients[i].active) {
+          freeSlot = (int)i;
+          break;
+        }
+      }
+      if (freeSlot < 0)
+        return;
+
+      WiFiClient incoming = server.accept();
+      if (!incoming)
+        return;
+      pendingHttpClients[freeSlot].client = incoming;
+      pendingHttpClients[freeSlot].acceptedAt = millis();
+      pendingHttpClients[freeSlot].active = true;
+    }
+  };
+  acceptPending(apiServer);
+  acceptPending(webServer80);
+
+  uint8_t handled = 0;
+  for (auto &pending : pendingHttpClients) {
+    if (!pending.active || !pending.client.available())
+      continue;
+
+    WiFiClient client = pending.client;
+    pending.client = WiFiClient();
+    pending.active = false;
+    serviceHttpClient(client);
+    if (client.connected())
+      client.stop(20);
+    if (++handled >= HTTP_CLIENTS_PER_LOOP)
+      break;
+  }
+}
+
+void serviceHttpClient(WiFiClient &client) {
+  if (!client || !client.available())
+    return;
+
+  client.setNoDelay(true);
+  client.setTimeout(1000);
+  String line = client.readStringUntil('\n');
+  line.trim();
+  if (!line.length()) {
+    client.stop(10);
+    return;
+  }
+  int firstSpace = line.indexOf(' ');
+  int secondSpace = line.indexOf(' ', firstSpace + 1);
+  String method = firstSpace > 0 ? line.substring(0, firstSpace) : "";
+  String target = (firstSpace > 0 && secondSpace > firstSpace)
+                      ? line.substring(firstSpace + 1, secondSpace)
+                      : "/";
+  int q = target.indexOf('?');
+  String path = q >= 0 ? target.substring(0, q) : target;
+  String query = q >= 0 ? target.substring(q + 1) : "";
+
+  // Drain HTTP headers safely and parse Content-Length if present
+  int contentLength = 0;
+  unsigned long drainStart = millis();
+  while (client.connected() && (millis() - drainStart < 1000)) {
+    if (client.available()) {
+      String header = client.readStringUntil('\n');
+      header.trim();
+      if (header.length() == 0)
+        break;
+      if (header.startsWith("Content-Length:") || header.startsWith("content-length:")) {
+        contentLength = header.substring(15).toInt();
+      }
+    } else {
+      delay(1);
+      ESP.wdtFeed();
+      optimistic_yield(1000);
+    }
+  }
+
+  if (method == "OPTIONS") {
+    sendHttpJson(client, 204, "{}");
+  } else if (method == "GET" && path == "/") {
+    sendEspHomeHtml(client);
+  } else if (method == "GET" && path == "/favicon.ico") {
+    static const char FAVICON_SVG[] =
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 120'><rect "
+        "width='100' height='120' rx='16' fill='#0b0e17'/><polygon "
+        "points='13,13 47,13 47,54 13,69' fill='#ffffff'/><polygon "
+        "points='13,75 47,60 47,107 13,107' fill='#ffffff'/><polygon "
+        "points='53,13 87,13 87,55 53,39' fill='#ffffff'/><polygon "
+        "points='53,45 87,61 87,107 53,107' fill='#ffffff'/></svg>";
+    size_t svgLen = strlen(FAVICON_SVG);
+    client.setNoDelay(true);
+    client.printf(
+        "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nCache-Control: "
+        "max-age=86400\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+        (unsigned)svgLen);
+    client.print(FAVICON_SVG);
+    client.stop(100);
+  } else if (method == "GET" &&
+             (path == "/api/status" || path == "/api/ping")) {
+    sendHttpJson(client, 200, statusJson());
+  } else if (method == "GET" && path == "/api/wifi/scan") {
+    sendHttpJson(client, 200, wifiScanJson());
+  } else if (method == "GET" && path == "/api/config-url") {
+    queueHttpConfig(client, configBodyFromQuery(query));
+  } else if (method == "GET" && path == "/api/printers-url") {
+    queueHttpConfig(client, configBodyFromQuery(query));
+  } else if (method == "GET" && path == "/api/printers") {
+    sendHttpJson(client, 200, printersJson());
+  } else if (method == "GET" && path == "/api/select-printer") {
+    String serial = "";
+    size_t start = 0;
+    while (start < query.length()) {
+      int amp = query.indexOf('&', start);
+      if (amp < 0)
+        amp = query.length();
+      String pair = query.substring(start, amp);
+      int eq = pair.indexOf('=');
+      if (eq > 0 && urlDecode(pair.substring(0, eq)) == "serial")
+        serial = urlDecode(pair.substring(eq + 1));
+      start = amp + 1;
+    }
+    if (selectPrinterBySerial(serial))
+      sendHttpJson(client, 200, "{\"ok\":true}");
+    else
+      sendHttpJson(client, 400,
+                   "{\"ok\":false,\"error\":\"printer not found\"}");
+  } else if (method == "GET" && path == "/api/refresh") {
+    cache.baseDrawn = false;
+    cache.offlineDrawn = false;
+    displayDirty = true;
+    sendHttpJson(client, 200, "{\"ok\":true}");
+  } else if (method == "POST" && path == "/api/config") {
+    String postBody;
+    if (contentLength > 0 && contentLength <= 4096) {
+      postBody.reserve(contentLength + 1);
+      unsigned long postStart = millis();
+      while ((int)postBody.length() < contentLength && client.connected() && (millis() - postStart < 2000)) {
+        if (client.available()) {
+          postBody += (char)client.read();
+        } else {
+          delay(1);
+          ESP.wdtFeed();
+          optimistic_yield(1000);
+        }
+      }
+    } else {
+      delay(20);
+      while (client.connected() && client.available()) {
+        postBody += (char)client.read();
+      }
+    }
+    if (postBody.length() > 0 && postBody.length() <= 4096) {
+      int sc = 200;
+      String resp = applyConfigBody(postBody, sc);
+      sendHttpJson(client, sc, resp);
+    } else {
+      sendHttpJson(client, 400, "{\"ok\":false,\"error\":\"bad request\"}");
+    }
+  } else {
+    sendHttpJson(client, 404, "{\"ok\":false,\"error\":\"not found\"}");
+  }
+}
+bool isEspServerListening() {
+  return serverStarted && (apiServer.status() != 0);
+}
+
+void restartEspServer() {
+  apiServer.close();
+  webServer80.close();
+  delay(20);
+  apiServer.begin();
+  webServer80.begin();
+  apiServer.setNoDelay(true);
+  webServer80.setNoDelay(true);
+  if (apiServer.status() != 0) {
+    serverStarted = true;
+    lastRecordedIp = WiFi.localIP();
+    Serial.printf("ESP server restarted: http://%s:%d/\n",
+                  WiFi.localIP().toString().c_str(), ESP_CONFIG_PORT);
+  } else {
+    serverStarted = false;
+  }
+}
+
+void handleSerialConfig() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r')
+      continue;
+    if (c == '\n') {
+      serialConfigLine.trim();
+      if (serialConfigLine.startsWith("{")) {
+        int statusCode = 200;
+        String response = handleSerialJson(serialConfigLine, statusCode);
+        Serial.println(response);
+      }
+      serialConfigLine = "";
+    } else if (serialConfigLine.length() < 2048) {
+      serialConfigLine += c;
+    } else {
+      serialConfigLine = "";
+    }
+  }
+}
+
+void startEspServer() {
+  if (isEspServerListening())
+    return;
+  apiServer.close();
+  webServer80.close();
+  delay(10);
+  apiServer.begin();
+  webServer80.begin();
+  apiServer.setNoDelay(true);
+  webServer80.setNoDelay(true);
+  if (apiServer.status() != 0) {
+    serverStarted = true;
+    lastRecordedIp = WiFi.localIP();
+    Serial.printf("ESP server: http://%s:%d/\n",
+                  WiFi.localIP().toString().c_str(), ESP_CONFIG_PORT);
+  } else {
+    serverStarted = false;
+  }
+}
+
+bool mqttConfigReady() {
+  return stored.mqttHost.length() > 0 && stored.mqttUsername.length() > 0 &&
+         stored.token.length() > 0 && stored.serial.length() > 0;
+}
+
+String reportTopic() { return String("device/") + stored.serial + "/report"; }
+
+String requestTopic() { return String("device/") + stored.serial + "/request"; }
+
+void mqttBufferRemainingLength(uint8_t *buf, size_t &pos, size_t len) {
+  do {
+    uint8_t digit = len % 128;
+    len /= 128;
+    if (len > 0)
+      digit |= 0x80;
+    buf[pos++] = digit;
+  } while (len > 0);
+}
+
+void mqttBufferByte(uint8_t *buf, size_t &pos, uint8_t value) {
+  buf[pos++] = value;
+}
+
+void mqttBufferString(uint8_t *buf, size_t &pos, const String &value) {
+  uint16_t len = value.length();
+  buf[pos++] = (uint8_t)(len >> 8);
+  buf[pos++] = (uint8_t)(len & 0xff);
+  memcpy(buf + pos, value.c_str(), len);
+  pos += len;
+}
+
+void mqttBufferBytes(uint8_t *buf, size_t &pos, const uint8_t *data, size_t len) {
+  memcpy(buf + pos, data, len);
+  pos += len;
+}
+
+bool mqttReadPacket(uint8_t *headerOut, uint8_t *body, size_t bodySize,
+                    size_t *bodyLen, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while (!mqttNet.available()) {
+    if (!mqttNet.connected() || millis() - start > timeoutMs) {
+      if (!mqttNet.connected())
+        mqttNet.stop();
+      return false;
+    }
+    delay(1);
+  }
+  int header = mqttNet.read();
+  if (header < 0) {
+    mqttNet.stop();
+    return false;
+  }
+
+  size_t len = 0;
+  int multiplier = 1;
+  uint8_t digit = 0;
+  do {
+    start = millis();
+    while (!mqttNet.available()) {
+      if (!mqttNet.connected() || millis() - start > 3000) {
+        mqttNet.stop();
+        return false;
+      }
+      delay(1);
+    }
+    digit = mqttNet.read();
+    len += (digit & 127) * multiplier;
+    multiplier *= 128;
+  } while (digit & 128);
+
+  // If packet length exceeds available body buffer (-1 for null-terminator)
+  if (len >= bodySize) {
+    Serial.printf("MQTT packet exceeds buffer (%u >= %u), resetting socket\n",
+                  (unsigned)len, (unsigned)bodySize);
+    mqttNet.stop();
+    return false;
+  }
+
+  size_t got = 0;
+  while (got < len) {
+    start = millis();
+    while (!mqttNet.available()) {
+      if (!mqttNet.connected() || millis() - start > 5000) {
+        char sslErr[64] = {0};
+        mqttNet.getLastSSLError(sslErr, sizeof(sslErr));
+        Serial.printf("MQTT inter-fragment timeout (>5s): got=%u len=%u conn=%d ssl=%s heap=%u\n",
+                      (unsigned)got, (unsigned)len, (int)mqttNet.connected(), sslErr, ESP.getFreeHeap());
+        mqttNet.stop();
+        return false;
+      }
+      delay(1);
+    }
+    int n = mqttNet.read(body + got, len - got);
+    if (n > 0)
+      got += (size_t)n;
+  }
+
+  body[got] = '\0'; // Always ensure safe null termination
+  if (headerOut)
+    *headerOut = (uint8_t)header;
+  if (bodyLen)
+    *bodyLen = got;
+  return true;
+}
+
+bool mqttSendConnect() {
+  String clientId = String("PrintSquare-") + String(ESP.getChipId(), HEX);
+  size_t remaining = 10 + 2 + clientId.length() + 2 +
+                     stored.mqttUsername.length() + 2 + stored.token.length();
+  size_t pos = 0;
+  mqttBufferByte(mqttBuf, pos, 0x10);
+  mqttBufferRemainingLength(mqttBuf, pos, remaining);
+  mqttBufferString(mqttBuf, pos, "MQTT");
+  mqttBufferByte(mqttBuf, pos, 4);    // protocol level 4 (MQTT 3.1.1)
+  mqttBufferByte(mqttBuf, pos, 0xC2); // connect flags: username, password, clean session
+  mqttBufferByte(mqttBuf, pos, 0);    // keepalive MSB
+  mqttBufferByte(mqttBuf, pos, 60);   // keepalive LSB (60 seconds)
+  mqttBufferString(mqttBuf, pos, clientId);
+  mqttBufferString(mqttBuf, pos, stored.mqttUsername);
+  mqttBufferString(mqttBuf, pos, stored.token);
+
+  size_t sent = mqttNet.write(mqttBuf, pos);
+  if (sent != pos) {
+    lastMqttError = "CONNECT write failed";
+    Serial.println("Cloud MQTT CONNECT write failed");
+    return false;
+  }
+
+  uint8_t header = 0;
+  size_t len = 0;
+  if (!mqttReadPacket(&header, mqttBuf, sizeof(mqttBuf), &len, 6000)) {
+    lastMqttError = "CONNACK timeout";
+    Serial.println("Cloud MQTT CONNACK timeout");
+    return false;
+  }
+  uint8_t type = header >> 4;
+  if (type == 2 && len >= 2 && mqttBuf[1] == 0) {
+    return true;
+  }
+  char errBuf[32];
+  snprintf(errBuf, sizeof(errBuf), "CONNACK rejected (%d)", (len >= 2 ? mqttBuf[1] : -1));
+  lastMqttError = errBuf;
+  Serial.printf("Cloud MQTT auth rejected code=%d\n", (len >= 2 ? mqttBuf[1] : -1));
+  return false;
+}
+
+bool mqttSendSubscribe(const String &topic) {
+  uint16_t id = mqttPacketId++;
+  if (mqttPacketId == 0)
+    mqttPacketId = 1;
+  size_t remaining = 2 + 2 + topic.length() + 1;
+  size_t pos = 0;
+  mqttBufferByte(mqttBuf, pos, 0x82);
+  mqttBufferRemainingLength(mqttBuf, pos, remaining);
+  mqttBufferByte(mqttBuf, pos, (uint8_t)(id >> 8));
+  mqttBufferByte(mqttBuf, pos, (uint8_t)(id & 0xff));
+  mqttBufferString(mqttBuf, pos, topic);
+  mqttBufferByte(mqttBuf, pos, 0); // QoS 0
+
+  size_t sent = mqttNet.write(mqttBuf, pos);
+  if (sent != pos) {
+    lastMqttError = "SUBSCRIBE write failed";
+    Serial.println("Cloud MQTT SUBSCRIBE write failed");
+    return false;
+  }
+
+  uint8_t header = 0;
+  size_t len = 0;
+  if (!mqttReadPacket(&header, mqttBuf, sizeof(mqttBuf), &len, 6000)) {
+    lastMqttError = "SUBACK timeout";
+    Serial.println("Cloud MQTT SUBACK timeout");
+    return false;
+  }
+  uint8_t type = header >> 4;
+  return type == 9;
+}
+
+bool mqttSendPublish(const String &topic, const char *payload) {
+  if (!mqttNet.connected())
+    return false;
+  size_t payloadLen = strlen(payload);
+  size_t remaining = 2 + topic.length() + payloadLen;
+  uint8_t pkt[256];
+  if (1 + 4 + 2 + topic.length() + payloadLen <= sizeof(pkt)) {
+    size_t pos = 0;
+    mqttBufferByte(pkt, pos, 0x30);
+    mqttBufferRemainingLength(pkt, pos, remaining);
+    mqttBufferString(pkt, pos, topic);
+    mqttBufferBytes(pkt, pos, (const uint8_t *)payload, payloadLen);
+    return mqttNet.write(pkt, pos) == pos;
+  }
+  // Fallback for larger payloads
+  size_t pos = 0;
+  mqttBufferByte(pkt, pos, 0x30);
+  mqttBufferRemainingLength(pkt, pos, remaining);
+  mqttBufferString(pkt, pos, topic);
+  if (mqttNet.write(pkt, pos) != pos)
+    return false;
+  return mqttNet.write((const uint8_t *)payload, payloadLen) == payloadLen;
+}
+
+void mqttSendPing() {
+  if (!mqttNet.connected())
+    return;
+  const uint8_t ping[2] = {0xC0, 0x00};
+  size_t sent = mqttNet.write(ping, 2);
+  lastMqttPing = millis();
+  if (sent != 2) {
+    triggerMqttReconnect("PING write failed");
+  }
+}
+
+void mqttSendPuback(uint16_t packetId) {
+  if (!mqttNet.connected())
+    return;
+  const uint8_t puback[4] = {
+      0x40, 0x02, (uint8_t)(packetId >> 8), (uint8_t)(packetId & 0xff)};
+  if (mqttNet.write(puback, 4) != 4) {
+    triggerMqttReconnect("PUBACK write failed");
+  }
+}
+
+void publishMqttRequest(const char *payload) {
+  if (!mqttNet.connected())
+    return;
+  String topic = requestTopic();
+  if (!mqttSendPublish(topic, payload)) {
+    triggerMqttReconnect("PUBLISH write failed");
+  }
+}
+
+void requestPrinterState() {
+  publishMqttRequest(
+      "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"pushall\"}}");
+  lastMqttRequest = millis();
+}
+
+bool applyFlatToolNozzles(JsonObject print) {
+  static const char *const tool0Keys[] = {"tool0_nozzle_temp",
+                                          "tool0_nozzle_temper"};
+  static const char *const tool1Keys[] = {"tool1_nozzle_temp",
+                                          "tool1_nozzle_temper"};
+  static const char *const leftKeys[] = {"left_nozzle_temp",
+                                         "left_nozzle_temper"};
+  static const char *const rightKeys[] = {"right_nozzle_temp",
+                                          "right_nozzle_temper"};
+  bool got = false;
+  float f = jsonFloatForKeys(print, tool0Keys,
+                             sizeof(tool0Keys) / sizeof(tool0Keys[0]), -999);
+  if (f != -999) {
+    storeNozzleTemp(0, f, true);
+    got = true;
+  }
+  f = jsonFloatForKeys(print, tool1Keys,
+                       sizeof(tool1Keys) / sizeof(tool1Keys[0]), -999);
+  if (f != -999) {
+    storeNozzleTemp(1, f, true);
+    pr.dualNozzle = true;
+    got = true;
+  }
+  f = jsonFloatForKeys(print, leftKeys, sizeof(leftKeys) / sizeof(leftKeys[0]),
+                       -999);
+  if (f != -999) {
+    storeNozzleTemp(0, f, false);
+    got = true;
+  }
+  f = jsonFloatForKeys(print, rightKeys,
+                       sizeof(rightKeys) / sizeof(rightKeys[0]), -999);
+  if (f != -999) {
+    storeNozzleTemp(1, f, false);
+    pr.dualNozzle = true;
+    got = true;
+  }
+  return got;
+}
+
+void applyPrint(JsonObject print) {
+  if (print.isNull())
+    return;
+  // 收到真实打印遥测 → 刷新"打印机活跃"时间戳（用于关机离线判定）
+  lastPrinterActivity = millis();
+
+  static const char *const statusKeys[] = {
+      "gcode_state", "print_status", "printStatus", "status",
+      "task_status", "taskStatus",   "state"};
+  const char *status = jsonStringForKeys(
+      print, statusKeys, sizeof(statusKeys) / sizeof(statusKeys[0]));
+  if (status[0]) {
+    pr.status = status;
+    pr.status.toLowerCase();
+    printerStatusReceived = true;
+  }
+
+  static const char *const progressKeys[] = {
+      "mc_percent",   "percent",        "progress",      "task_progress",
+      "taskProgress", "print_progress", "printProgress", "printPercent"};
+  float f =
+      jsonFloatForKeys(print, progressKeys,
+                       sizeof(progressKeys) / sizeof(progressKeys[0]), -999);
+  if (f != -999)
+    pr.progress = normalizePercent(f);
+
+  bool gotNestedNozzle = applyNestedNozzleTemps(print);
+  bool gotFlatToolNozzle = applyFlatToolNozzles(print);
+  if (!pr.dualNozzle && !gotNestedNozzle && !gotFlatToolNozzle) {
+    static const char *const nozzleKeys[] = {
+        "nozzle_temper",     "nozzle_temp", "nozzle_temperature",
+        "nozzleTemperature", "hotend_temp", "hotend_temperature"};
+    f = jsonFloatForKeys(print, nozzleKeys,
+                         sizeof(nozzleKeys) / sizeof(nozzleKeys[0]), -999);
+    if (f == -999)
+      f = nestedNozzleTemp(print, -999);
+    if (f != -999)
+      pr.nozzleTemp = normalizeTemp(f);
+  }
+
+  static const char *const bedKeys[] = {
+      "bed_temper",    "bed_temp",    "bed_temperature",   "bedTemperature",
+      "hotbed_temper", "hotbed_temp", "hotbed_temperature"};
+  f = jsonFloatForKeys(print, bedKeys, sizeof(bedKeys) / sizeof(bedKeys[0]),
+                       -999);
+  if (f == -999)
+    f = nestedBedTemp(print, -999);
+  if (f != -999)
+    pr.bedTemp = f;
+
+  static const char *const modelKeys[] = {"model", "dev_model_name",
+                                          "dev_product_name", "product_name"};
+  const char *model = jsonStringForKeys(
+      print, modelKeys, sizeof(modelKeys) / sizeof(modelKeys[0]));
+  if (model[0])
+    pr.model = model;
+
+  static const char *const chamberKeys[] = {"chamber_temper",
+                                            "chamber_temp",
+                                            "chamber_temperature",
+                                            "chamberTemperature",
+                                            "chamberTemp",
+                                            "chamberTargetTemp",
+                                            "chamberTargetTemperature",
+                                            "chamber_target_temper",
+                                            "chamber_target_temp",
+                                            "chamber_target_temperature",
+                                            "target_chamber_temp",
+                                            "targetChamberTemp",
+                                            "ctt"};
+  f = jsonFloatForKeys(print, chamberKeys,
+                       sizeof(chamberKeys) / sizeof(chamberKeys[0]), -999);
+  String chamberModel = pr.model.length() ? pr.model : stored.model;
+  if ((f == -999 || f < 0 || f > 120) &&
+      chamberFallbackAllowedForModel(chamberModel)) {
+    f = jsonFloat(print["device"]["ctc"]["info"]["temp"], -999);
+  }
+  if ((f == -999 || f < 0 || f > 120) &&
+      chamberFallbackAllowedForModel(chamberModel)) {
+    f = jsonFloat(print["info"]["temp"], -999);
+  }
+  if (f != -999 && f > -50 && f < 120)
+    pr.chamberTemp = f;
+
+  static const char *const remainingMinuteKeys[] = {
+      "mc_remaining_time", "remaining_minutes", "remainingMinutes",
+      "remaining_min", "remain_time"};
+  int i = jsonIntForKeys(
+      print, remainingMinuteKeys,
+      sizeof(remainingMinuteKeys) / sizeof(remainingMinuteKeys[0]), -999);
+  if (i == -999) {
+    static const char *const remainingSecondKeys[] = {
+        "remaining_seconds", "remainingSeconds", "remaining_time",
+        "remainingTime", "mc_left_time"};
+    int seconds = jsonIntForKeys(
+        print, remainingSecondKeys,
+        sizeof(remainingSecondKeys) / sizeof(remainingSecondKeys[0]), -999);
+    if (seconds != -999)
+      i = (seconds + 59) / 60;
+  }
+  if (i != -999)
+    pr.remainingMin = i;
+
+  static const char *const currentLayerKeys[] = {"layer_num", "current_layer",
+                                                 "currentLayer", "layer"};
+  i = jsonIntForKeys(print, currentLayerKeys,
+                     sizeof(currentLayerKeys) / sizeof(currentLayerKeys[0]),
+                     -999);
+  if (i != -999)
+    pr.currentLayer = i;
+
+  static const char *const totalLayerKeys[] = {"total_layer_num",
+                                               "total_layers", "totalLayers",
+                                               "layer_count", "layerCount"};
+  i = jsonIntForKeys(print, totalLayerKeys,
+                     sizeof(totalLayerKeys) / sizeof(totalLayerKeys[0]), -999);
+  if (i != -999)
+    pr.totalLayers = i;
+
+  // 细分阶段：stg_cur 是整数（X1 空闲 -1 / P1 空闲 255），部分固件回传字符串。
+  static const char *const stageKeys[] = {"stg_cur", "stgCur"};
+  i = jsonIntForKeys(print, stageKeys, sizeof(stageKeys) / sizeof(stageKeys[0]),
+                     -999);
+  if (i != -999)
+    pr.stageCur = i;
+
+  // Check AMS presence via ams_exist_bits
+  if (!print["ams_exist_bits"].isNull()) {
+    const char *bits = print["ams_exist_bits"];
+    if (bits) {
+      pr.amsExist = (atoi(bits) > 0);
+    } else {
+      pr.amsExist = (print["ams_exist_bits"].as<int>() > 0);
+    }
+  } else if (!print["ams"]["ams_exist_bits"].isNull()) {
+    const char *bits = print["ams"]["ams_exist_bits"];
+    if (bits) {
+      pr.amsExist = (atoi(bits) > 0);
+    } else {
+      pr.amsExist = (print["ams"]["ams_exist_bits"].as<int>() > 0);
+    }
+  }
+
+  // Parse AMS tray data
+  JsonObject amsObj = print["ams"];
+  if (!amsObj.isNull()) {
+    if (!amsObj["tray_now"].isNull()) {
+      const char *tn = amsObj["tray_now"];
+      if (tn)
+        pr.activeTray = atoi(tn);
+      else
+        pr.activeTray = amsObj["tray_now"] | -1;
+    }
+    JsonArray amsArray = amsObj["ams"];
+    if (!amsArray.isNull()) {
+      if (amsArray.size() > 0) {
+        pr.amsExist = true;
+        JsonObject firstAms = amsArray[0];
+        JsonArray trays = firstAms["tray"];
+        if (!trays.isNull()) {
+          int count = min((int)trays.size(), 4);
+          for (int k = 0; k < count; k++) {
+            JsonObject tray = trays[k];
+            const char *tt = tray["tray_type"];
+            if (tt && strlen(tt) > 0) {
+              pr.amsSlots[k].valid = true;
+              pr.amsSlots[k].trayType = tt;
+              pr.amsSlots[k].traySubBrands = tray["tray_sub_brands"] | "";
+              const char *tag = tray["tag_uid"];
+              pr.amsSlots[k].tagUid = tag ? tag : "";
+              pr.amsSlots[k].isOfficial = isOfficialTag(tag);
+              const char *tc = tray["tray_color"];
+              if (tc && strlen(tc) >= 8) {
+                pr.amsSlots[k].trayColor = strtoul(tc, nullptr, 16);
+              } else if (tc && strlen(tc) >= 6) {
+                pr.amsSlots[k].trayColor = strtoul(tc, nullptr, 16) << 8;
+              }
+              pr.amsSlots[k].remain = tray["remain"] | -1;
+            } else {
+              pr.amsSlots[k].valid = false;
+              pr.amsSlots[k].isOfficial = false;
+              pr.amsSlots[k].tagUid = "";
+            }
+          }
+        }
+      } else {
+        pr.amsExist = false;
+      }
+    }
+  }
+
+  // Parse External Spool / Virtual Tray (vt_tray) data
+  JsonObject vtObj = print["vt_tray"];
+  if (vtObj.isNull() && !amsObj.isNull()) {
+    vtObj = amsObj["vt_tray"];
+  }
+  if (!vtObj.isNull()) {
+    const char *tt = vtObj["tray_type"];
+    if (tt && strlen(tt) > 0) {
+      pr.extSlot.valid = true;
+      pr.extSlot.trayType = tt;
+      pr.extSlot.traySubBrands = vtObj["tray_sub_brands"] | "";
+      const char *tag = vtObj["tag_uid"];
+      pr.extSlot.tagUid = tag ? tag : "";
+      pr.extSlot.isOfficial = isOfficialTag(tag);
+      const char *tc = vtObj["tray_color"];
+      if (tc && strlen(tc) >= 8) {
+        pr.extSlot.trayColor = strtoul(tc, nullptr, 16);
+      } else if (tc && strlen(tc) >= 6) {
+        pr.extSlot.trayColor = strtoul(tc, nullptr, 16) << 8;
+      }
+      pr.extSlot.remain = vtObj["remain"] | -1;
+    } else {
+      // vt_tray 存在但 tray_type 为空 → 外挂槽确实没有料盘。必须显式清掉旧值，
+      // 否则一旦被写过就会永久残留（applyPrint 里没有别的地方会复位它）。
+      pr.extSlot.valid = false;
+      pr.extSlot.trayType = "";
+      pr.extSlot.traySubBrands = "";
+      pr.extSlot.tagUid = "";
+      pr.extSlot.trayColor = 0;
+      pr.extSlot.remain = -1;
+      pr.extSlot.isOfficial = false;
+    }
+  }
+  // 顶层 print.tray_type / filament_type 表示"当前正在使用的耗材"：AMS 打印时它来自
+  // AMS 槽位，并不是外挂料盘。只有"设备没有 AMS"或"当前明确选中外挂料盘(tray_now=254)"
+  // 时才能用它推断外挂槽，否则网页会多出一个并不存在的外挂料盘（换料时尤其明显）。
+  if ((!pr.amsExist || pr.activeTray == 254) &&
+      (!print["tray_type"].isNull() || !print["filament_type"].isNull())) {
+    const char *tt = print["tray_type"];
+    if (!tt || strlen(tt) == 0)
+      tt = print["filament_type"];
+    if (tt && strlen(tt) > 0) {
+      pr.extSlot.valid = true;
+      pr.extSlot.trayType = tt;
+      if (!print["tray_sub_brands"].isNull())
+        pr.extSlot.traySubBrands = print["tray_sub_brands"].as<const char *>();
+      if (!print["tag_uid"].isNull()) {
+        const char *tag = print["tag_uid"];
+        pr.extSlot.tagUid = tag ? tag : "";
+        pr.extSlot.isOfficial = isOfficialTag(tag);
+      }
+      const char *tc = print["tray_color"];
+      if (tc && strlen(tc) >= 8) {
+        pr.extSlot.trayColor = strtoul(tc, nullptr, 16);
+      } else if (tc && strlen(tc) >= 6) {
+        pr.extSlot.trayColor = strtoul(tc, nullptr, 16) << 8;
+      }
+      if (!print["remain"].isNull()) {
+        pr.extSlot.remain = print["remain"] | -1;
+      }
+    }
+  }
+
+  if (!print["subtray_id"].isNull()) {
+    pr.activeTray = print["subtray_id"] | pr.activeTray;
+  } else if (!print["tray_now"].isNull()) {
+    const char *tn = print["tray_now"];
+    if (tn)
+      pr.activeTray = atoi(tn);
+    else
+      pr.activeTray = print["tray_now"] | pr.activeTray;
+  }
+
+  if (!print["spd_lvl"].isNull())
+    pr.spdLvl = print["spd_lvl"] | 1;
+  else if (!print["spdLvl"].isNull())
+    pr.spdLvl = print["spdLvl"] | 1;
+
+  if (!print["spd_mag"].isNull())
+    pr.spdMag = print["spd_mag"] | 100;
+  else if (!print["spdMag"].isNull())
+    pr.spdMag = print["spdMag"] | 100;
+
+  // 无真实状态数据前不置 online：避免重启后 MQTT 一连上就把默认
+  // "prepare" 当成真实状态显示成 PREP
+  if (printerStatusReceived &&
+      !hasToken(pr.status, "offline") && !hasToken(pr.status, "disconnect")) {
+    pr.online = true;
+  } else {
+    pr.online = false;
+  }
+  displayDirty = true;
+}
+
+const char *findPattern(const char *data, size_t length, const char *pattern) {
+  size_t patternLen = strlen(pattern);
+  if (patternLen == 0 || length < patternLen)
+    return nullptr;
+  for (size_t i = 0; i <= length - patternLen; ++i) {
+    if (memcmp(data + i, pattern, patternLen) == 0)
+      return data + i;
+  }
+  return nullptr;
+}
+
+const char *jsonObjectEnd(const char *start, const char *end) {
+  int depth = 0;
+  bool inString = false;
+  bool escape = false;
+  for (const char *p = start; p < end; ++p) {
+    char c = *p;
+    if (inString) {
+      if (escape)
+        escape = false;
+      else if (c == '\\')
+        escape = true;
+      else if (c == '"')
+        inString = false;
+      continue;
+    }
+    if (c == '"')
+      inString = true;
+    else if (c == '{')
+      depth++;
+    else if (c == '}') {
+      depth--;
+      if (depth == 0)
+        return p + 1;
+    }
+  }
+  return nullptr;
+}
+
+void applyExtruderFromRawPayload(uint8_t *payload, size_t length) {
+  const char *data = (const char *)payload;
+  const char *payloadEnd = data + length;
+  const char *extPos = findPattern(data, length, "\"extruder\":");
+  if (!extPos)
+    return;
+
+  const char *objStart = extPos + strlen("\"extruder\":");
+  while (objStart < payloadEnd && (*objStart == ' ' || *objStart == '\t'))
+    objStart++;
+  if (objStart >= payloadEnd || *objStart != '{')
+    return;
+  const char *objEnd = jsonObjectEnd(objStart, payloadEnd);
+  if (!objEnd)
+    return;
+
+  static JsonDocument extDoc;
+  extDoc.clear();
+  if (deserializeJson(extDoc, objStart, (size_t)(objEnd - objStart)))
+    return;
+  if (applyNozzleInfo(extDoc["info"].as<JsonArray>()))
+    displayDirty = true;
+}
+
+static JsonDocument mqttFilter;
+static bool mqttFilterInitialized = false;
+
+void initMqttFilter() {
+  if (mqttFilterInitialized)
+    return;
+  mqttFilter["print"]["ams_exist_bits"] = true;
+  mqttFilter["print"]["ams"]["ams_exist_bits"] = true;
+  mqttFilter["print"]["ams"]["ams"][0]["tray"][0]["tray_type"] = true;
+  mqttFilter["print"]["ams"]["ams"][0]["tray"][0]["tray_sub_brands"] = true;
+  mqttFilter["print"]["ams"]["ams"][0]["tray"][0]["tray_color"] = true;
+  mqttFilter["print"]["ams"]["ams"][0]["tray"][0]["remain"] = true;
+  mqttFilter["print"]["ams"]["ams"][0]["tray"][0]["tag_uid"] = true;
+  mqttFilter["print"]["ams"]["tray_now"] = true;
+  mqttFilter["print"]["ams"]["vt_tray"]["tray_type"] = true;
+  mqttFilter["print"]["ams"]["vt_tray"]["tray_sub_brands"] = true;
+  mqttFilter["print"]["ams"]["vt_tray"]["tray_color"] = true;
+  mqttFilter["print"]["ams"]["vt_tray"]["remain"] = true;
+  mqttFilter["print"]["ams"]["vt_tray"]["tag_uid"] = true;
+  mqttFilter["print"]["vt_tray"]["tray_type"] = true;
+  mqttFilter["print"]["vt_tray"]["tray_sub_brands"] = true;
+  mqttFilter["print"]["vt_tray"]["tray_color"] = true;
+  mqttFilter["print"]["vt_tray"]["remain"] = true;
+  mqttFilter["print"]["vt_tray"]["tag_uid"] = true;
+  mqttFilter["print"]["tag_uid"] = true;
+  mqttFilter["print"]["tray_type"] = true;
+  mqttFilter["print"]["tray_sub_brands"] = true;
+  mqttFilter["print"]["tray_color"] = true;
+  mqttFilter["print"]["filament_type"] = true;
+  mqttFilter["print"]["remain"] = true;
+  mqttFilter["print"]["tray_now"] = true;
+  mqttFilter["print"]["subtray_id"] = true;
+  mqttFilter["print"]["spd_lvl"] = true;
+  mqttFilter["print"]["spd_mag"] = true;
+  mqttFilter["print"]["spdLvl"] = true;
+  mqttFilter["print"]["spdMag"] = true;
+  mqttFilter["print"]["gcode_state"] = true;
+  mqttFilter["print"]["stg_cur"] = true;
+  mqttFilter["print"]["stgCur"] = true;
+  mqttFilter["print"]["print_status"] = true;
+  mqttFilter["print"]["printStatus"] = true;
+  mqttFilter["print"]["status"] = true;
+  mqttFilter["print"]["task_status"] = true;
+  mqttFilter["print"]["taskStatus"] = true;
+  mqttFilter["print"]["state"] = true;
+  mqttFilter["print"]["mc_percent"] = true;
+  mqttFilter["print"]["percent"] = true;
+  mqttFilter["print"]["progress"] = true;
+  mqttFilter["print"]["task_progress"] = true;
+  mqttFilter["print"]["taskProgress"] = true;
+  mqttFilter["print"]["print_progress"] = true;
+  mqttFilter["print"]["printProgress"] = true;
+  mqttFilter["print"]["printPercent"] = true;
+  mqttFilter["print"]["nozzle_temper"] = true;
+  mqttFilter["print"]["nozzle_temp"] = true;
+  mqttFilter["print"]["nozzle_temperature"] = true;
+  mqttFilter["print"]["nozzleTemperature"] = true;
+  mqttFilter["print"]["hotend_temp"] = true;
+  mqttFilter["print"]["hotend_temperature"] = true;
+  mqttFilter["print"]["tool0_nozzle_temp"] = true;
+  mqttFilter["print"]["tool0_nozzle_temper"] = true;
+  mqttFilter["print"]["tool1_nozzle_temp"] = true;
+  mqttFilter["print"]["tool1_nozzle_temper"] = true;
+  mqttFilter["print"]["left_nozzle_temp"] = true;
+  mqttFilter["print"]["left_nozzle_temper"] = true;
+  mqttFilter["print"]["right_nozzle_temp"] = true;
+  mqttFilter["print"]["right_nozzle_temper"] = true;
+  mqttFilter["print"]["bed_temper"] = true;
+  mqttFilter["print"]["bed_temp"] = true;
+  mqttFilter["print"]["bed_temperature"] = true;
+  mqttFilter["print"]["bedTemperature"] = true;
+  mqttFilter["print"]["hotbed_temper"] = true;
+  mqttFilter["print"]["hotbed_temp"] = true;
+  mqttFilter["print"]["hotbed_temperature"] = true;
+  mqttFilter["print"]["chamber_temper"] = true;
+  mqttFilter["print"]["chamber_temp"] = true;
+  mqttFilter["print"]["chamber_temperature"] = true;
+  mqttFilter["print"]["chamberTemperature"] = true;
+  mqttFilter["print"]["chamberTemp"] = true;
+  mqttFilter["print"]["chamberTargetTemp"] = true;
+  mqttFilter["print"]["chamberTargetTemperature"] = true;
+  mqttFilter["print"]["chamber_target_temper"] = true;
+  mqttFilter["print"]["chamber_target_temp"] = true;
+  mqttFilter["print"]["chamber_target_temperature"] = true;
+  mqttFilter["print"]["target_chamber_temp"] = true;
+  mqttFilter["print"]["targetChamberTemp"] = true;
+  mqttFilter["print"]["ctt"] = true;
+  mqttFilter["print"]["device"]["ctc"]["info"]["temp"] = true;
+  mqttFilter["print"]["info"]["temp"] = true;
+  mqttFilter["print"]["model"] = true;
+  mqttFilter["print"]["dev_model_name"] = true;
+  mqttFilter["print"]["dev_product_name"] = true;
+  mqttFilter["print"]["product_name"] = true;
+  mqttFilter["print"]["mc_remaining_time"] = true;
+  mqttFilter["print"]["remaining_minutes"] = true;
+  mqttFilter["print"]["remainingMinutes"] = true;
+  mqttFilter["print"]["remaining_min"] = true;
+  mqttFilter["print"]["remain_time"] = true;
+  mqttFilter["print"]["remaining_seconds"] = true;
+  mqttFilter["print"]["remainingSeconds"] = true;
+  mqttFilter["print"]["remaining_time"] = true;
+  mqttFilter["print"]["remainingTime"] = true;
+  mqttFilter["print"]["mc_left_time"] = true;
+  mqttFilter["print"]["layer_num"] = true;
+  mqttFilter["print"]["current_layer"] = true;
+  mqttFilter["print"]["currentLayer"] = true;
+  mqttFilter["print"]["layer"] = true;
+  mqttFilter["print"]["total_layer_num"] = true;
+  mqttFilter["print"]["total_layers"] = true;
+  mqttFilter["print"]["totalLayers"] = true;
+  mqttFilter["print"]["layer_count"] = true;
+  mqttFilter["print"]["layerCount"] = true;
+  mqttFilter["print"]["device"]["bed"]["info"]["temp"] = true;
+  mqttFilter["print"]["device"]["bed_temp"] = true;
+  mqttFilter["print"]["device"]["extruder"]["info"][0]["id"] = true;
+  mqttFilter["print"]["device"]["extruder"]["info"][0]["temp"] = true;
+  mqttFilter["print"]["device"]["extruder"]["info"][1]["id"] = true;
+  mqttFilter["print"]["device"]["extruder"]["info"][1]["temp"] = true;
+  mqttFilter["print"]["device"]["nozzle"]["info"][0]["id"] = true;
+  mqttFilter["print"]["device"]["nozzle"]["info"][0]["temp"] = true;
+  mqttFilter["print"]["device"]["nozzle"]["info"][1]["id"] = true;
+  mqttFilter["print"]["device"]["nozzle"]["info"][1]["temp"] = true;
+  mqttFilterInitialized = true;
+}
+
+void parseMqttPayload(uint8_t *payload, size_t length) {
+  initMqttFilter();
+  static JsonDocument doc;
+  doc.clear();
+  DeserializationError err = deserializeJson(
+      doc, payload, length, DeserializationOption::Filter(mqttFilter));
+  if (err) {
+    Serial.printf("JSON parse err: %s (len: %u, free heap: %u)\n",
+                  err.c_str(), (unsigned)length, ESP.getFreeHeap());
+    static uint8_t jsonErrCount = 0;
+    jsonErrCount++;
+    if (jsonErrCount >= 3) {
+      jsonErrCount = 0;
+      triggerMqttReconnect("Repeated JSON parse failures");
+    }
+    return;
+  }
+
+  const char *res = doc["result"] | doc["print"]["result"] | "";
+  if (strcmp(res, "fail") == 0 || strcmp(res, "failed") == 0) {
+    Serial.printf("[MQTT] Cloud returned failure: %s\n", res);
+  }
+
+  applyPrint(doc["print"].as<JsonObject>());
+  applyExtruderFromRawPayload(payload, length);
+}
+
+void mqttHandleIncoming() {
+  while (mqttNet.connected() && mqttNet.available()) {
+    uint8_t header = 0;
+    size_t len = 0;
+    if (!mqttReadPacket(&header, mqttBuf, sizeof(mqttBuf), &len, 200)) {
+      if (!mqttNet.connected()) {
+        triggerMqttReconnect("Socket closed during read");
+      }
+      return;
+    }
+    uint8_t type = header >> 4;
+    if (type == 3 && len > 2) {
+      lastMqttDataReceived = millis();
+      uint8_t qos = (header >> 1) & 0x03;
+      uint16_t topicLen = ((uint16_t)mqttBuf[0] << 8) | mqttBuf[1];
+      size_t headerOffset = 2 + topicLen;
+      if (qos > 0 && headerOffset + 2 <= len) {
+        uint16_t packetId = ((uint16_t)mqttBuf[headerOffset] << 8) |
+                            mqttBuf[headerOffset + 1];
+        if (qos == 1) {
+          mqttSendPuback(packetId);
+        }
+        headerOffset += 2;
+      }
+      if (headerOffset < len) {
+        parseMqttPayload(mqttBuf + headerOffset, len - headerOffset);
+      }
+    } else if (type == 13) {
+      lastMqttDataReceived = millis();
+    } else if (type == 14) {
+      triggerMqttReconnect("Broker sent DISCONNECT");
+      return;
+    }
+  }
+}
+
+bool connectMqtt() {
+  if (WiFi.status() != WL_CONNECTED || !mqttConfigReady())
+    return false;
+  if (mqttNet.connected())
+    return true;
+
+  char clientId[48];
+  snprintf(clientId, sizeof(clientId), "PrintSquare-%06X", ESP.getChipId());
+  Serial.printf("Cloud MQTT connecting %s serial=%s user=%s (free heap: %u)\n",
+                stored.mqttHost.c_str(), stored.serial.c_str(),
+                stored.mqttUsername.c_str(), ESP.getFreeHeap());
+  mqttNet.stop();
+  if (!mqttNet.connect(stored.mqttHost.c_str(), MQTT_PORT)) {
+    char sslErr[128] = {0};
+    mqttNet.getLastSSLError(sslErr, sizeof(sslErr));
+    lastMqttError = String("TCP/TLS connect failed: ") + sslErr;
+    Serial.printf("Cloud MQTT TCP failed: %s (free heap: %u)\n", sslErr, ESP.getFreeHeap());
+    return false;
+  }
+  if (!mqttSendConnect()) {
+    if (lastMqttError.length() == 0)
+      lastMqttError = "Auth failed";
+    Serial.println("Cloud MQTT auth failed");
+    mqttNet.stop();
+    return false;
+  }
+
+  String topic = reportTopic();
+  if (!mqttSendSubscribe(topic)) {
+    if (lastMqttError.length() == 0)
+      lastMqttError = "Subscribe failed";
+    Serial.println("Cloud MQTT subscribe failed");
+    mqttNet.stop();
+    return false;
+  }
+
+  lastMqttError = "";
+  lastMqttDataReceived = millis();
+  mqttReconnectDelay = MQTT_RECONNECT_INTERVAL;
+  // 从未收到过状态数据（刚重启/刚换打印机）时保持 offline，
+  // 避免默认 "prepare" 在无真实数据时被显示成 PREP
+  pr.online = printerStatusReceived;
+  publishMqttRequest(
+      "{\"info\":{\"sequence_id\":\"0\",\"command\":\"get_version\"}}");
+  publishMqttRequest(
+      "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"start\"}}");
+  static String lastSubscribedSerial = "";
+  if (lastSubscribedSerial != stored.serial) {
+    lastSubscribedSerial = stored.serial;
+    resetLivePrintFields();
+  }
+  requestPrinterState();
+  Serial.print("Cloud MQTT subscribed: ");
+  Serial.println(topic);
+  return true;
+}
+
+void drawFrameTrack() {
+  tft.fillRect(FRAME_X, FRAME_Y, FRAME_SIZE, FRAME_THICK, C_TRACK);
+  tft.fillRect(FRAME_X + FRAME_SIZE - FRAME_THICK, FRAME_Y, FRAME_THICK,
+               FRAME_SIZE, C_TRACK);
+  tft.fillRect(FRAME_X, FRAME_Y + FRAME_SIZE - FRAME_THICK, FRAME_SIZE,
+               FRAME_THICK, C_TRACK);
+  tft.fillRect(FRAME_X, FRAME_Y, FRAME_THICK, FRAME_SIZE, C_TRACK);
+}
+
+void drawFrameProgressLen(int len, uint16_t color) {
+  if (len <= 0)
+    return;
+
+  int top = min(len, FRAME_SIDE);
+  if (top > 0)
+    tft.fillRect(FRAME_X, FRAME_Y, top, FRAME_THICK, color);
+  len -= top;
+
+  int right = min(len, FRAME_SIDE);
+  if (right > 0)
+    tft.fillRect(FRAME_X + FRAME_SIZE - FRAME_THICK, FRAME_Y, FRAME_THICK,
+                 right, color);
+  len -= right;
+
+  int bottom = min(len, FRAME_SIDE);
+  if (bottom > 0)
+    tft.fillRect(FRAME_X + FRAME_SIZE - bottom,
+                 FRAME_Y + FRAME_SIZE - FRAME_THICK, bottom, FRAME_THICK,
+                 color);
+  len -= bottom;
+
+  int left = min(len, FRAME_SIDE);
+  if (left > 0)
+    tft.fillRect(FRAME_X, FRAME_Y + FRAME_SIZE - left, FRAME_THICK, left,
+                 color);
+}
+
+int progressToLen(float progress) {
+  if (progress < 0)
+    return 0;
+  if (progress > 100)
+    progress = 100;
+  int len = (int)(progress * FRAME_TOTAL / 100.0f + 0.5f);
+  if (progress > 0 && len < 1)
+    len = 1;
+  if (len > FRAME_TOTAL)
+    len = FRAME_TOTAL;
+  return len;
+}
+
+void updateFrameProgress() {
+  int len = progressToLen(pr.progress);
+  drawFrameTrack();
+  drawFrameProgressLen(len, C_RING);
+  cache.progress = len;
+}
+
+void drawBold(const String &text, int x, int y) {
+  tft.drawString(text, x, y);
+  tft.drawString(text, x + 1, y);
+}
+
+void drawTextBox(int x, int y, int w, int h, uint8_t font, uint16_t color,
+                 const String &text, bool bold, uint16_t bg = BG_BLACK) {
+  tft.fillRect(x, y, w, h, bg);
+  tft.setTextFont(font);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(color, bg);
+  tft.setTextPadding(0);
+  if (bold)
+    drawBold(text, x + w / 2, y + h / 2);
+  else
+    tft.drawString(text, x + w / 2, y + h / 2);
+}
+
+String fitTextToWidth(String text, uint8_t font, int maxWidth, bool bold) {
+  tft.setTextFont(font);
+  int suffixW = tft.textWidth("..") + (bold ? 1 : 0);
+  if (tft.textWidth(text) + (bold ? 1 : 0) <= maxWidth)
+    return text;
+  while (text.length() > 0 &&
+         tft.textWidth(text) + suffixW + (bold ? 1 : 0) > maxWidth) {
+    text.remove(text.length() - 1);
+  }
+  return text.length() ? text + ".." : String("..");
+}
+
+void drawTempBox(int x, int y, int w, int h, int value, uint16_t color) {
+  tft.fillRect(x, y, w, h, BG_BLACK);
+  tft.setTextFont(4);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(color, BG_BLACK);
+  tft.setTextPadding(0);
+  if (value < 0) {
+    drawBold("--", x + w / 2, y + h / 2);
+    return;
+  }
+
+  char b[16];
+  snprintf(b, sizeof(b), "%d", value);
+  int cx = x + w / 2;
+  int cy = y + h / 2;
+  int numberW = tft.textWidth(b);
+  int totalW = numberW + 17;
+  int numberX = cx - totalW / 2 + numberW / 2;
+  drawBold(b, numberX, cy);
+  int dotX = numberX + numberW / 2 + 6;
+  tft.drawCircle(dotX, cy - 8, 2, C_TEXT);
+  tft.drawString("C", dotX + 11, cy);
+}
+
+void drawTempBoxSoft(int x, int y, int w, int h, int value, uint16_t color) {
+  tft.fillRect(x, y, w, h, BG_BLACK);
+  tft.setTextFont(4);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(color, BG_BLACK);
+  tft.setTextPadding(0);
+  if (value < 0) {
+    tft.drawString("--", x + w / 2, y + h / 2);
+    return;
+  }
+
+  char b[16];
+  snprintf(b, sizeof(b), "%d", value);
+  int cx = x + w / 2;
+  int cy = y + h / 2;
+  int numberW = tft.textWidth(b);
+  int totalW = numberW + 16;
+  int numberX = cx - totalW / 2 + numberW / 2;
+  tft.drawString(b, numberX, cy);
+  int dotX = numberX + numberW / 2 + 6;
+  tft.drawCircle(dotX, cy - 8, 2, C_TEXT);
+  tft.drawString("C", dotX + 10, cy);
+}
+
+void drawDualNozzleTempBox(int x, int y, int w, int h, int side, int value,
+                           uint16_t color) {
+  int clearX = min(x, 21);
+  int clearRight = max(x + w, 21 + 86);
+  tft.fillRect(clearX, y, clearRight - clearX, h, BG_BLACK);
+  tft.setTextFont(4);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(color, BG_BLACK);
+  tft.setTextPadding(0);
+  if (value < 0) {
+    tft.drawString("--", x + w / 2, y + h / 2);
+    return;
+  }
+
+  char b[16];
+  snprintf(b, sizeof(b), "%c %d", side == 1 ? 'R' : 'L', value);
+  int textW = tft.textWidth(b);
+  int totalW = textW + 13;
+  int cy = y + h / 2;
+  int textX = x + w / 2 - totalW / 2 + textW / 2;
+  tft.drawString(b, textX, cy);
+  int dotX = textX + textW / 2 + 4;
+  tft.drawCircle(dotX, cy - 8, 2, C_TEXT);
+  tft.drawString("C", dotX + 8, cy);
+}
+
+bool hasDualNozzleTemps() {
+  return pr.dualNozzle && pr.leftNozzleTemp >= 0 && pr.rightNozzleTemp >= 0;
+}
+
+bool dualNozzleDisplayMode() { return pr.dualNozzle; }
+
+int displayedNozzleSide() {
+  if (hasDualNozzleTemps())
+    return ((millis() / DUAL_NOZZLE_SWITCH_MS) % 2) == 0 ? 0 : 1;
+  if (pr.dualNozzle && pr.leftNozzleTemp >= 0)
+    return 0;
+  if (pr.dualNozzle && pr.rightNozzleTemp >= 0)
+    return 1;
+  return -1;
+}
+
+float displayedNozzleTemp() {
+  int side = displayedNozzleSide();
+  if (side == 0)
+    return pr.leftNozzleTemp;
+  if (side == 1)
+    return pr.rightNozzleTemp;
+  return pr.nozzleTemp;
+}
+
+const char *displayedNozzleLabel() { return "NOZZLE"; }
+
+void drawLabels() {
+  tft.fillRect(24, 98, 82, 18, BG_BLACK);
+  tft.fillRect(134, 98, 82, 18, BG_BLACK);
+  tft.setTextFont(2);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_DIM, BG_BLACK);
+  tft.setTextPadding(0);
+  tft.drawString(displayedNozzleLabel(), 65, 107);
+  tft.drawString("BED", 175, 107);
+}
+
+bool isPrinterOnline() {
+  return mqttNet.connected() && pr.online &&
+         !hasToken(pr.status, "offline") && !hasToken(pr.status, "disconnect");
+}
+
+String statusText() {
+  if (!isPrinterOnline())
+    return "offline";
+  if (isPrintingState(pr.status))
+    return "printing";
+  if (isPreparingState(pr.status))
+    return "prepare";
+  if (isPausedState(pr.status))
+    return "paused";
+  if (isFinishedState(pr.status))
+    return "done";
+  if (isFailedState(pr.status))
+    return "error";
+  return "idle";
+}
+
+uint16_t statusColor() {
+  if (!isPrinterOnline())
+    return C_ORANGE;
+  if (isPrintingState(pr.status))
+    return C_RING;
+  if (isPreparingState(pr.status))
+    return C_CYAN;
+  if (isPausedState(pr.status))
+    return C_ORANGE;
+  if (isFinishedState(pr.status))
+    return C_BLUE;
+  if (isFailedState(pr.status))
+    return C_RED;
+  return C_DIM;
+}
+
+void drawBold(const String &text, int x, int y);
+String fitTextToWidth(String text, uint8_t font, int maxWidth, bool bold);
+
+// stg_cur -> 右上角英文缩写。未收录/空闲阶段返回空串（由调用方回退到通用状态词）。
+String stageAbbrevText() {
+  if (pr.stageCur < 0 || pr.stageCur > 77)
+    return "";
+  // 逐字节 pgm_read_byte 读出，避免对 flash 指针直接 strlen
+  char buf[9];
+  uint8_t k = 0;
+  for (; k < 8; ++k) {
+    char c = (char)pgm_read_byte(&CN_STAGE_EN[pr.stageCur][k]);
+    buf[k] = c;
+    if (c == '\0')
+      break;
+  }
+  buf[k] = '\0';
+  return String(buf);
+}
+
+// 右上角最终状态词：有细分阶段时用缩写，否则回退到原有状态词（fallback）。
+// 只有"打印中/准备中/暂停中"才细分；DONE / ERR / IDLE / OFFLINE 保持原样，
+// 避免阶段值滞后时把完成或报错状态盖掉。
+String headerStatusText(const String &fallback) {
+  if (isPrinterOnline() &&
+      (isPrintingState(pr.status) || isPreparingState(pr.status) ||
+       isPausedState(pr.status))) {
+    String stage = stageAbbrevText();
+    if (stage.length())
+      return stage;
+  }
+  return fallback;
+}
+
+String dashboardStatusText() {
+  if (!isPrinterOnline())
+    return "OFFLINE";
+  if (isPrintingState(pr.status))
+    return "PRINT";
+  if (isPreparingState(pr.status))
+    return "PREP";
+  if (isPausedState(pr.status))
+    return "PAUSE";
+  if (isFinishedState(pr.status))
+    return "DONE";
+  if (isFailedState(pr.status))
+    return "ERR";
+  return "IDLE";
+}
+
+String timeText(int minutes) {
+  if (minutes < 0)
+    return "--";
+  int h = minutes / 60;
+  int m = minutes % 60;
+  char b[18];
+  if (h > 0)
+    snprintf(b, sizeof(b), "%dh%02dm", h, m);
+  else
+    snprintf(b, sizeof(b), "%dm", m);
+  return b;
+}
+
+String classicRemainingText(int minutes) {
+  if (minutes < 0)
+    return "--";
+  int h = minutes / 60;
+  int m = minutes % 60;
+  char b[18];
+  if (h > 0)
+    snprintf(b, sizeof(b), "%dh%02d", h, m);
+  else
+    snprintf(b, sizeof(b), "%dm", m);
+  return b;
+}
+
+String etaText() {
+  if (pr.remainingMin < 0)
+    return "--";
+  time_t now = time(nullptr);
+  if (now < 1700000000)
+    return "~";
+  now += (time_t)pr.remainingMin * 60;
+  struct tm *info = localtime(&now);
+  if (!info)
+    return "~";
+  char b[8];
+  snprintf(b, sizeof(b), "%02d:%02d", info->tm_hour, info->tm_min);
+  return b;
+}
+
+int hexNibble(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return 0;
+}
+
+void drawProgmemHexBitmap(const char *hex, int w, int h, int x, int y,
+                          uint16_t color) {
+  int bytesPerRow = (w + 7) / 8;
+  for (int row = 0; row < h; ++row) {
+    for (unsigned int col = 0; col < w; ++col) {
+      int byteIndex = row * bytesPerRow + col / 8;
+      int hexIndex = byteIndex * 2;
+      char hi = (char)pgm_read_byte(hex + hexIndex);
+      char lo = (char)pgm_read_byte(hex + hexIndex + 1);
+      uint8_t value = (hexNibble(hi) << 4) | hexNibble(lo);
+      if (value & (0x80 >> (col & 7)))
+        tft.drawPixel(x + col, y + row, color);
+    }
+  }
+}
+
+void drawCnCentered(const char *hex, int w, int h, int x, int y, int boxW,
+                    int boxH, uint16_t color) {
+  drawProgmemHexBitmap(hex, w, h, x + (boxW - w) / 2, y + (boxH - h) / 2,
+                       color);
+}
+
+// ===========================================================================
+// 状态文字：屏幕右上角统一入口（英文缩写 / 中文点阵字）
+// 中文点阵字模见 cn_stage_glyphs.h（黑体 16px，1bpp，与 font2 同高，
+// 因此三种布局都不需要改动原有元素位置）。
+// ===========================================================================
+
+// 屏幕是否使用英文缩写（默认 en，保持原有英文显示）
+bool uiLangIsEn() { return !(stored.uiLang == "zh"); }
+
+// 通用状态（非细分阶段）对应的中文标签索引
+uint8_t genericCnLabel() {
+  if (!isPrinterOnline())
+    return CN_LBL_OFFLINE;
+  if (isPrintingState(pr.status))
+    return CN_LBL_PRINT;
+  if (isPreparingState(pr.status))
+    return CN_LBL_PREP;
+  if (isPausedState(pr.status))
+    return CN_LBL_PAUSE;
+  if (isFinishedState(pr.status))
+    return CN_LBL_DONE;
+  if (isFailedState(pr.status))
+    return CN_LBL_ERR;
+  return CN_LBL_IDLE;
+}
+
+// 只有"确实存在细分阶段"时才返回阶段标签，否则返回 CN_LBL_NONE。
+// 用于网页"当前动作"一行：没有具体阶段时显示空，而不是拿通用状态顶上。
+uint8_t stageOnlyCnLabel() {
+  if (isPrinterOnline() &&
+      (isPrintingState(pr.status) || isPreparingState(pr.status) ||
+       isPausedState(pr.status))) {
+    String abbr = stageAbbrevText();
+    if (abbr.length())
+      return (uint8_t)pr.stageCur;
+  }
+  return CN_LBL_NONE;
+}
+
+// 当前应显示的中文标签：有细分阶段用阶段中文，其余（完成/失败/空闲/离线）
+// 用通用状态中文，避免阶段值滞后时盖掉终态。
+uint8_t currentCnLabel() {
+  uint8_t stage = stageOnlyCnLabel();
+  return (stage != CN_LBL_NONE) ? stage : genericCnLabel();
+}
+
+// 标签 -> UTF-8 汉字文本（供 /api/status 与调试输出）
+String cnLabelText(uint8_t label) {
+  if (label >= CN_LABEL_COUNT)
+    return "";
+  char buf[13]; // 最长 4 个汉字 = 12 字节 + NUL
+  uint8_t k = 0;
+  for (; k < 12; ++k) {
+    char c = (char)pgm_read_byte(&CN_LABEL_UTF8[label][k]);
+    buf[k] = c;
+    if (c == '\0')
+      break;
+  }
+  buf[k] = '\0';
+  return String(buf);
+}
+
+// 右对齐绘制标签的中文点阵字（2~4 字，每字 16x16，间隔 2px）；
+// topY 与 font2 文本顶端对齐（高度相同）。4 字共 4*16+3*2 = 70px。
+void drawCnLabelRight(int rightX, int topY, uint8_t label, uint16_t color) {
+  if (label >= CN_LABEL_COUNT)
+    return;
+  uint8_t ids[CN_MAX_CHARS];
+  int n = 0;
+  for (; n < CN_MAX_CHARS; ++n) {
+    uint8_t gi = (uint8_t)pgm_read_byte(&CN_LABEL_GLYPH[label][n]);
+    if (gi == 0xFF)
+      break;
+    ids[n] = gi;
+  }
+  if (n <= 0)
+    return;
+  const int gap = 2;
+  const int totalW = CN_GLYPH_W * n + gap * (n - 1);
+  int x = rightX - totalW;
+  for (int k = 0; k < n; ++k) {
+    uint8_t gi = ids[k];
+    if (gi >= CN_GLYPH_COUNT)
+      continue;
+    drawProgmemHexBitmap(CN_GLYPH[gi], CN_GLYPH_W, CN_GLYPH_H,
+                         x + k * (CN_GLYPH_W + gap), topY, color);
+  }
+}
+
+// 右上角状态绘制统一入口：
+//   中文模式 -> 两个中文点阵字（宽度 34px，远小于原 58px 文本区）
+//   英文模式 -> 原有英文缩写/状态词，仍用 fitTextToWidth 限制在 58px 内
+void drawHeaderStatus(int rightX, int topY, const String &enFallback,
+                      uint16_t color) {
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(color, C_CARD);
+  tft.setTextPadding(0);
+  if (!uiLangIsEn()) {
+    uint8_t label = currentCnLabel();
+    if (label != CN_LBL_NONE) {
+      drawCnLabelRight(rightX, topY, label, color);
+      return;
+    }
+  }
+  tft.drawString(fitTextToWidth(headerStatusText(enFallback), 2, 58, false),
+                 rightX, topY);
+}
+
+// 时钟布局底部状态卡的脏检查键：状态词 + 细分阶段 + 语言，
+// 三者任一变化都要重绘（阶段变化很频繁，必须参与脏检查）。
+String clockStatusKey() {
+  char buf[28];
+  snprintf(buf, sizeof(buf), "%s|%d|%s", dashboardStatusText().c_str(),
+           pr.stageCur, stored.uiLang.c_str());
+  return String(buf);
+}
+
+void drawAliasBitmap(int x, int y, uint16_t color) {
+  int w = stored.aliasBitmapW;
+  int h = stored.aliasBitmapH;
+  if (w <= 0 || h <= 0 || !stored.aliasBitmapHex.length())
+    return;
+  int bytesPerRow = (w + 7) / 8;
+  for (int row = 0; row < h; ++row) {
+    for (int col = 0; col < w; ++col) {
+      int byteIndex = row * bytesPerRow + col / 8;
+      int hexIndex = byteIndex * 2;
+      if (hexIndex + 1 >= stored.aliasBitmapHex.length())
+        return;
+      uint8_t value = (hexNibble(stored.aliasBitmapHex[hexIndex]) << 4) |
+                      hexNibble(stored.aliasBitmapHex[hexIndex + 1]);
+      if (value & (0x80 >> (col & 7)))
+        tft.drawPixel(x + col, y + row, color);
+    }
+  }
+}
+
+void drawDashboardStatusCn(int x, int y, int w, int h) {
+  if (isPrintingState(pr.status)) {
+    drawCnCentered(CN_PRINT, 55, 23, x, y, w, h, C_TEXT);
+    return;
+  }
+  if (isPreparingState(pr.status)) {
+    drawCnCentered(CN_READY, 55, 23, x, y, w, h, C_TEXT);
+    return;
+  }
+  if (isPausedState(pr.status)) {
+    drawCnCentered(CN_PAUSE, 36, 17, x, y, w, h, C_TEXT);
+    return;
+  }
+  if (isFinishedState(pr.status)) {
+    drawCnCentered(CN_DONE, 36, 17, x, y, w, h, C_TEXT);
+    return;
+  }
+  if (isFailedState(pr.status)) {
+    drawCnCentered(CN_ERR, 36, 17, x, y, w, h, C_TEXT);
+    return;
+  }
+  drawCnCentered(CN_IDLE, 36, 17, x, y, w, h, C_TEXT);
+}
+
+void drawDashboardTextBox(int x, int y, int w, int h, uint16_t bg, uint8_t font,
+                          uint16_t color, const String &text,
+                          bool bold = false) {
+  tft.fillRoundRect(x, y, w, h, 6, bg);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(font);
+  tft.setTextColor(color, bg);
+  tft.setTextPadding(w - 8);
+  // Try requested font first, fall back to font 2 if text is too wide
+  uint8_t useFont = font;
+  tft.setTextFont(font);
+  if (tft.textWidth(text) + (bold ? 1 : 0) > w - 8) {
+    useFont = 2;
+  }
+  String shown = fitTextToWidth(text, useFont, w - 8, bold);
+  if (bold)
+    drawBold(shown, x + w / 2, y + h / 2);
+  else
+    tft.drawString(shown, x + w / 2, y + h / 2);
+  tft.setTextPadding(0);
+}
+
+String nozzleSummary() {
+  char b[20];
+  if (pr.dualNozzle && (pr.leftNozzleTemp >= 0 || pr.rightNozzleTemp >= 0)) {
+    char l[8], r[8];
+    if (pr.leftNozzleTemp >= 0)
+      snprintf(l, sizeof(l), "%d", (int)(pr.leftNozzleTemp + 0.5f));
+    else
+      strcpy(l, "--");
+    if (pr.rightNozzleTemp >= 0)
+      snprintf(r, sizeof(r), "%d", (int)(pr.rightNozzleTemp + 0.5f));
+    else
+      strcpy(r, "--");
+    snprintf(b, sizeof(b), "%s/%s", l, r);
+    return b;
+  }
+  if (pr.nozzleTemp >= 0) {
+    snprintf(b, sizeof(b), "%d", (int)(pr.nozzleTemp + 0.5f));
+    return b;
+  }
+  return "--";
+}
+
+String tempSummary(float value) {
+  if (value < 0)
+    return "~";
+  char b[8];
+  snprintf(b, sizeof(b), "%d", (int)(value + 0.5f));
+  return b;
+}
+
+String normalizedModelName(const String &value) {
+  String raw = value;
+  raw.trim();
+  String key = raw;
+  key.toUpperCase();
+  key.replace("-", "");
+  key.replace("_", "");
+  key.replace(" ", "");
+  if (!key.length())
+    return raw;
+  if (key == "BLP001" || key.indexOf("X1C") >= 0 ||
+      key.indexOf("X1CARBON") >= 0)
+    return "X1C";
+  if (key == "C11" || key.indexOf("P1P") >= 0)
+    return "P1P";
+  if (key == "C12" || key.indexOf("P1S") >= 0)
+    return "P1S";
+  if (key == "C13" || key.indexOf("X1E") >= 0)
+    return "X1E";
+  if (key == "N1" || key.indexOf("A1MINI") >= 0)
+    return "A1 mini";
+  if (key == "N2S" || key == "A1")
+    return "A1";
+  if (key == "N6V2" || key.indexOf("X2D") >= 0)
+    return "X2D";
+  if (key == "N7V2" || key.indexOf("P2S") >= 0)
+    return "P2S";
+  if (key == "O1C2V2" || key.indexOf("H2C") >= 0)
+    return "H2C";
+  if (key == "O1D" || key.indexOf("H2D") >= 0)
+    return "H2D";
+  if (key == "O1S" || key.indexOf("H2S") >= 0)
+    return "H2S";
+  return raw;
+}
+
+bool isPureAscii(const String &s) {
+  if (!s.length())
+    return false;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    if ((uint8_t)s.charAt(i) > 127)
+      return false;
+  }
+  return true;
+}
+
+String getTopLeftDisplayName() {
+  String candidate = "";
+  if (stored.alias.length())
+    candidate = stored.alias;
+  else if (pr.displayName.length())
+    candidate = pr.displayName;
+  else if (stored.name.length())
+    candidate = stored.name;
+
+  if (candidate.length() > 0 && isPureAscii(candidate)) {
+    return candidate;
+  }
+  return normalizedModelName(pr.model.length() ? pr.model : stored.model);
+}
+
+bool chamberFallbackAllowedForModel(const String &value) {
+  String model = normalizedModelName(value);
+  model.toUpperCase();
+  return model == "P2S" || model == "X2D" || model == "H2C" || model == "H2D" ||
+         model == "H2S";
+}
+
+bool modelHasChamberSensor(const String &value) {
+  String model = normalizedModelName(value);
+  model.toUpperCase();
+  // P1S, P1P, A1, A1 mini have no chamber sensor; others (X1C, X1E, P2S, X2D,
+  // H2x) do
+  return model != "P1S" && model != "P1P" && model != "A1" && model != "A1MINI";
+}
+void drawDashboardProgressRing(int progressValue) {
+  int pct = progressValue;
+  if (pct < 0)
+    pct = 0;
+  if (pct > 100)
+    pct = 100;
+
+  tft.fillRect(18, 74, 108, 80, C_CARD);
+  char b[12];
+  if (progressValue >= 0)
+    snprintf(b, sizeof(b), "%d", progressValue);
+  else
+    strcpy(b, "--");
+  drawDashboardTextBox(21, 99, 102, 34, C_CARD, 4, C_TEXT, b, false);
+}
+
+void drawDashboardMetricCard(int x, int y, const char *labelHex, int labelW,
+                             int labelH, const String &value,
+                             uint8_t valueFont = 4) {
+  tft.fillRoundRect(x, y, 100, 48, 7, C_CARD);
+  tft.drawRoundRect(x, y, 100, 48, 7, 0x294A);
+  drawCnCentered(labelHex, labelW, labelH, x + 6, y + 4, 88, 20, C_TEXT);
+  drawDashboardTextBox(x + 8, y + 24, 84, 20, C_CARD, valueFont, C_TEXT, value,
+                       false);
+}
+
+void drawDashboardCelsiusValue(int x, int y, int w, int h, const String &value,
+                               uint8_t font) {
+  tft.fillRoundRect(x, y, w, h, 6, C_CARD);
+  tft.drawRoundRect(x, y, w, h, 6, 0x294A);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_TEXT, C_CARD);
+  tft.setTextFont(font);
+  uint8_t drawFont = font;
+  if (tft.textWidth(value) > w - 2) {
+    drawFont = 2;
+    tft.setTextFont(drawFont);
+  }
+  tft.setTextPadding(w);
+  tft.drawString(value, x + w / 2, y + h / 2);
+  tft.setTextPadding(0);
+}
+
+void drawDashboardTempCard(int x, int y, const char *labelHex, int labelW,
+                           int labelH, const String &value,
+                           uint8_t valueFont = 4) {
+  tft.fillRoundRect(x, y, 100, 48, 7, C_CARD);
+  tft.drawRoundRect(x, y, 100, 48, 7, 0x294A);
+  drawCnCentered(labelHex, labelW, labelH, x + 6, y + 4, 88, 20, C_TEXT);
+  drawDashboardCelsiusValue(x + 2, y + 24, 96, 20, value, valueFont);
+}
+
+static uint32_t manualStringHash(const String &s) {
+  uint32_t h = 0;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    h = h * 31 + (uint8_t)s.charAt(i);
+  }
+  return h;
+}
+
+uint16_t filamentColor(uint32_t argb) {
+  uint8_t r = (argb >> 24) & 0xFF;
+  uint8_t g = (argb >> 16) & 0xFF;
+  uint8_t b = (argb >> 8) & 0xFF;
+  return ((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3);
+}
+
+void drawGlassCard(int x, int y, int w, int h, int radius,
+                   uint16_t bg = C_CARD, uint16_t border = C_GLASS_LO,
+                   uint16_t accent = C_RING) {
+  if (w < 4 || h < 4) return;
+  tft.fillRoundRect(x, y, w, h, radius, bg);
+  tft.drawRoundRect(x, y, w, h, radius, border);
+  int inset = min(radius, min(w / 2, h / 2));
+  tft.drawFastHLine(x + inset, y + 1, w - inset * 2, C_GLASS_HI);
+  tft.drawFastVLine(x + 1, y + inset, h - inset * 2, C_GLASS_HI);
+  tft.drawFastHLine(x + inset, y + h - 2, w - inset * 2, C_GLASS_LO);
+  tft.drawFastVLine(x + w - 2, y + inset, h - inset * 2, C_GLASS_LO);
+  tft.fillRect(x + 3, y + 5, 2, h - 10, accent);
+}
+
+uint16_t mixBgr565(uint16_t from, uint16_t to, int step, int span) {
+  if (span <= 0) return from;
+  if (step <= 0) return from;
+  if (step >= span) return to;
+  uint16_t fb = (from >> 11) & 0x1F;
+  uint16_t fg = (from >> 5) & 0x3F;
+  uint16_t fr = from & 0x1F;
+  uint16_t tb = (to >> 11) & 0x1F;
+  uint16_t tg = (to >> 5) & 0x3F;
+  uint16_t tr = to & 0x1F;
+  uint16_t b = fb + (((tb - fb) * step) / span);
+  uint16_t g = fg + (((tg - fg) * step) / span);
+  uint16_t r = fr + (((tr - fr) * step) / span);
+  return (b << 11) | (g << 5) | r;
+}
+
+void drawGlassProgress(int x, int y, int w, int h, int pct, int radius) {
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  tft.fillRoundRect(x, y, w, h, radius, C_GLASS_BG);
+  tft.drawRoundRect(x, y, w, h, radius, C_GLASS_LO);
+  if (pct <= 0) return;
+  int filled = (pct * w) / 100;
+  if (filled < radius) filled = radius;
+  tft.fillRoundRect(x, y, filled, h, radius, C_RING);
+  for (int i = 0; i < filled; ++i) {
+    uint16_t color = mixBgr565(C_RING, C_CYAN, i, w - 1);
+    tft.drawFastVLine(x + i, y + 2, h - 4, color);
+  }
+}
+
+void drawDashboardSlotCard(int slotX, const AmsTrayInfo &slot, bool isActive,
+                           const char *slotLabel, const char *emptyLabel) {
+  // Card Background & Highlight Border
+  uint16_t bgCol = isActive ? 0x1A04 : C_CARD;
+  uint16_t borderCol = isActive ? C_RING : 0x294A;
+
+  drawGlassCard(slotX, 102, 44, 46, 6, bgCol, borderCol);
+
+  if (isActive) {
+    // Active indicator triangle at top center of slot card
+    tft.fillTriangle(slotX + 19, 100, slotX + 25, 100, slotX + 22, 103,
+                     C_RING);
+  } else {
+    // Clear active indicator triangle above top border when slot is no longer active
+    tft.fillRect(slotX + 18, 99, 9, 3, C_CARD);
+  }
+
+  if (slot.valid) {
+    // Color Swatch
+    uint16_t col565 = filamentColor(slot.trayColor);
+    tft.fillRoundRect(slotX + 4, 106, 12, 12, 3, col565);
+    tft.drawRoundRect(slotX + 4, 106, 12, 12, 3, C_TEXT);
+
+    // Slot Number or "ext"
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(1);
+    tft.setTextColor(isActive ? C_RING : C_DIM, bgCol);
+    tft.drawString(slotLabel, slotX + 18, 107);
+
+    // Short Filament Type (e.g. PLA, PETG, ABS)
+    String shortType =
+        slot.traySubBrands.length() ? slot.traySubBrands : slot.trayType;
+    if (shortType.startsWith("PLA"))
+      shortType = "PLA";
+    else if (shortType.startsWith("ABS"))
+      shortType = "ABS";
+    else if (shortType.startsWith("PETG"))
+      shortType = "PETG";
+    else if (shortType.startsWith("TPU"))
+      shortType = "TPU";
+    else if (shortType.startsWith("PA"))
+      shortType = "PA";
+    else if (shortType.startsWith("PC"))
+      shortType = "PC";
+    else if (shortType.startsWith("ASA"))
+      shortType = "ASA";
+    else if (shortType.startsWith("Support"))
+      shortType = "SPT";
+    else if (shortType.length() > 5)
+      shortType = shortType.substring(0, 5);
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(1);
+    tft.setTextColor(C_TEXT, bgCol);
+    tft.drawString(shortType, slotX + 22, 124);
+
+    // Remaining capacity % (Only displayed for official Bambu filaments with RFID)
+    if (slot.isOfficial && slot.remain >= 0 && slot.remain <= 100) {
+      char rStr[8];
+      snprintf(rStr, sizeof(rStr), "%d%%", slot.remain);
+      tft.setTextColor(C_DIM, bgCol);
+      tft.drawString(rStr, slotX + 22, 137);
+    }
+  } else {
+    // Empty / Invalid Slot
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(1);
+    tft.setTextColor(C_DIM, bgCol);
+    tft.drawString(emptyLabel, slotX + 22, 118);
+    tft.drawString("--", slotX + 22, 132);
+  }
+}
+
+void drawDashboardBase() {
+  tft.fillScreen(BG_BLACK);
+  tft.drawRoundRect(4, 4, 232, 232, 8, 0x294A);
+
+  // 1. Top Header Capsule Bar (y: 10, h: 22, r: 11)
+  drawGlassCard(14, 10, 212, 22, 11);
+
+  // 2. Middle Progress Hero Card Base (y: 36, h: 118, r: 10)
+  drawGlassCard(14, 36, 212, 118, 10);
+
+  // Progress Bar Track Base inside Hero Card (y: 86, h: 12, r: 6)
+  drawGlassProgress(24, 86, 192, 12, 0, 6);
+
+  // 3. Bottom Metric Cards Base (y: 160, h: 68, r: 8)
+  // Left Temp Card
+  drawGlassCard(14, 160, 102, 68, 8);
+
+  // Right Time Card
+  drawGlassCard(124, 160, 102, 68, 8);
+
+  cache.progressPct = -999;
+  cache.nozzleTemp = -999;
+  cache.nozzleSide = -2;
+  cache.bedTemp = -999;
+  cache.chamberTemp = -999;
+  cache.remainingMin = -999;
+  cache.currentLayer = -999;
+  cache.totalLayers = -999;
+  cache.status = "";
+  cache.displayName = "";
+  cache.model = "";
+  cache.alias = "";
+  cache.layout = "dashboard";
+  cache.activeTray = -999;
+  cache.amsHash = 0;
+  cache.amsExist = false;
+  cache.dashTimeRemaining = -999;
+  cache.dashStatus = "";
+  cache.spdLvl = -999;
+  cache.spdMag = -999;
+  cache.baseDrawn = true;
+  cache.offlineDrawn = false;
+}
+
+void drawDashboardFields() {
+  // 1. Top Header Capsule Bar (Model on left, Status + LED on right)
+  String model = getTopLeftDisplayName();
+  String st = headerStatusText(dashboardStatusText());
+  if (model != cache.model || st != cache.status) {
+    drawGlassCard(14, 10, 212, 22, 11);
+
+    // Left: Model（限宽 92：右侧中文标签最多 4 字 70px，从 x=126 起，互不遮挡）
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(C_TEXT, C_CARD);
+    tft.drawString(fitTextToWidth(model.length() ? model : "--", 2, 92, false), 24, 13);
+
+    // Right: Status + LED
+    uint16_t ledColor = isPrinterOnline() ? statusColor() : C_ORANGE;
+    tft.fillCircle(206, 21, 4, ledColor);
+
+    drawHeaderStatus(196, 13, dashboardStatusText(), statusColor());
+
+    cache.model = model;
+    cache.status = st;
+  }
+
+  // 2. Middle Progress Hero Card (Percentage, Layer, Speed Mode & Glow-Head
+  // Progress Bar)
+  int progressValue = pr.progress >= 0 ? (int)(pr.progress + 0.5f) : -1;
+  bool heroDirty = (progressValue != cache.progressPct) ||
+                   (pr.currentLayer != cache.currentLayer) ||
+                   (pr.totalLayers != cache.totalLayers) ||
+                   (pr.spdLvl != cache.spdLvl) || (pr.spdMag != cache.spdMag);
+
+  if (heroDirty) {
+    // Clear Hero Card top text section
+    tft.fillRect(16, 38, 208, 46, C_CARD);
+    tft.fillRect(17, 41, 2, 43, C_RING);
+
+    // Large Percentage Text on Left
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(7);
+    tft.setTextColor(C_TEXT, C_CARD);
+    if (progressValue >= 0) {
+      char b[8];
+      snprintf(b, sizeof(b), "%d", progressValue);
+      tft.drawString(b, 24, 37);
+
+      // Percentage Symbol at bottom-right of number
+      int pctX = 24 + tft.textWidth(b) + 2;
+      tft.setTextFont(4);
+      tft.setTextColor(C_RING, C_CARD);
+      tft.drawString("%", pctX, 58);
+    } else {
+      tft.drawString("--", 24, 37);
+    }
+
+    // Right Upper: Layer Info
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(C_CYAN, C_CARD);
+    if (pr.currentLayer >= 0 && pr.totalLayers > 0) {
+      char l[16];
+      snprintf(l, sizeof(l), "L %d/%d", pr.currentLayer, pr.totalLayers);
+      tft.drawString(l, 216, 40);
+    } else if (pr.currentLayer >= 0) {
+      char l[8];
+      snprintf(l, sizeof(l), "L %d", pr.currentLayer);
+      tft.drawString(l, 216, 40);
+    } else {
+      // 没有层数信息时退回显示状态：与顶栏同一入口，中文模式下也是中文点阵
+      drawHeaderStatus(216, 40, st, C_CYAN);
+    }
+
+    // Right Lower: Speed Profile (Option 1)
+    uint16_t spdColor = C_DIM;
+    String spdStr = "----";
+    if (pr.spdLvl == 1) {
+      spdColor = C_RING; // Green for Silent
+      spdStr =
+          String("Silent ") + (pr.spdMag > 0 ? String(pr.spdMag) + "%" : "50%");
+    } else if (pr.spdLvl == 3) {
+      spdColor = C_ORANGE; // Orange for Sport
+      spdStr =
+          String("Sport ") + (pr.spdMag > 0 ? String(pr.spdMag) + "%" : "124%");
+    } else if (pr.spdLvl == 4) {
+      spdColor = C_RED; // Red for Ludicrous
+      spdStr = String("Ludicrous ") +
+               (pr.spdMag > 0 ? String(pr.spdMag) + "%" : "166%");
+    } else if (pr.spdLvl == 2) {
+      // spdLvl == 2 (Standard)
+      spdColor = C_CYAN; // Cyan for Standard
+      spdStr =
+          String("Std ") + (pr.spdMag > 0 ? String(pr.spdMag) + "%" : "100%");
+    } else {
+      spdColor = C_DIM;
+      spdStr = "----";
+    }
+
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(spdColor, C_CARD);
+    tft.drawString(spdStr, 216, 58);
+
+    // Progress Bar Track with Glow Head (y: 86, h: 12)
+    drawGlassProgress(24, 86, 192, 12, progressValue, 6);
+
+    cache.progressPct = progressValue;
+    cache.currentLayer = pr.currentLayer;
+    cache.totalLayers = pr.totalLayers;
+    cache.spdLvl = pr.spdLvl;
+    cache.spdMag = pr.spdMag;
+  }
+
+  // 3. AMS / Ext Tray Panel inside Hero Card (y: 102, h: 48)
+  uint32_t _amsHash = 0;
+  if (pr.amsExist) {
+    _amsHash = 0xAA550000;
+    for (int k = 0; k < 4; k++) {
+      if (pr.amsSlots[k].valid) {
+        _amsHash ^= pr.amsSlots[k].trayColor;
+        _amsHash ^= (uint32_t)((uint8_t)pr.amsSlots[k].remain) << (k * 8);
+        _amsHash ^= manualStringHash(pr.amsSlots[k].trayType) << 16;
+        _amsHash ^= (pr.amsSlots[k].isOfficial ? 1 : 0) << (k + 8);
+      }
+    }
+  } else {
+    _amsHash = 0x55AA0000;
+    const AmsTrayInfo &ext = pr.extSlot.valid ? pr.extSlot : pr.amsSlots[0];
+    if (ext.valid) {
+      _amsHash ^= ext.trayColor;
+      _amsHash ^= (uint32_t)((uint8_t)ext.remain);
+      _amsHash ^= manualStringHash(ext.trayType) << 16;
+      _amsHash ^= (ext.isOfficial ? 1 : 0) << 8;
+    }
+  }
+
+  if (_amsHash != cache.amsHash || pr.activeTray != cache.activeTray ||
+      pr.amsExist != cache.amsExist) {
+    if (pr.amsExist) {
+      for (int k = 0; k < 4; k++) {
+        int slotX = 22 + k * 47;
+        bool isActive = (pr.activeTray == k);
+        char slotNumStr[4];
+        snprintf(slotNumStr, sizeof(slotNumStr), "%d", k + 1);
+        char emptyStr[8];
+        snprintf(emptyStr, sizeof(emptyStr), "A%d", k + 1);
+        drawDashboardSlotCard(slotX, pr.amsSlots[k], isActive, slotNumStr,
+                              emptyStr);
+      }
+    } else {
+      // No AMS connected: Only draw slot 0 as "ext"
+      const AmsTrayInfo &ext = pr.extSlot.valid ? pr.extSlot : pr.amsSlots[0];
+      int slotX = 22;
+      // tray_now=255 只是"没有选中料盘"，不应把外挂槽点亮成在用
+      bool isActive = (pr.activeTray == 254 ||
+                       pr.activeTray == 0 || pr.activeTray == 1 ||
+                       pr.status == "running" || pr.status == "pause");
+      drawDashboardSlotCard(slotX, ext, isActive, "ext", "ext");
+
+      // Clear the area for slots 2, 3, 4 inside Hero Card (x: 68..210, y: 99..150)
+      tft.fillRect(68, 99, 142, 51, C_CARD);
+    }
+    cache.amsHash = _amsHash;
+    cache.activeTray = pr.activeTray;
+    cache.amsExist = pr.amsExist;
+  }
+
+  // 3. Bottom Left Card: Temperatures (y: 160, h: 68)
+  int nozzleSide = displayedNozzleSide();
+  float nozzleT = displayedNozzleTemp();
+  int nozzleV = nozzleT >= 0 ? (int)(nozzleT + 0.5f) : -1;
+  int bedV = pr.bedTemp >= 0 ? (int)(pr.bedTemp + 0.5f) : -1;
+  int chamberV = pr.chamberTemp >= 0 ? (int)(pr.chamberTemp + 0.5f) : -1;
+
+  String chamberModelName =
+      normalizedModelName(pr.model.length() ? pr.model : stored.model);
+  if (!modelHasChamberSensor(chamberModelName))
+    chamberV = -1;
+
+  if (nozzleV != cache.nozzleTemp || bedV != cache.bedTemp ||
+      chamberV != cache.chamberTemp || nozzleSide != cache.nozzleSide) {
+    drawGlassCard(14, 160, 102, 68, 8);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(2);
+
+    // Nozzle
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("NOZ", 20, 166);
+    tft.setTextColor(nozzleV >= 0 ? C_YELLOW : C_DIM, C_CARD);
+    char nb[12];
+    if (nozzleV >= 0)
+      snprintf(nb, sizeof(nb), "%dC", nozzleV);
+    else
+      strcpy(nb, "--");
+    tft.drawString(nb, 62, 166);
+
+    // Bed
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("BED", 20, 186);
+    tft.setTextColor(bedV >= 0 ? C_ORANGE : C_DIM, C_CARD);
+    char bb[12];
+    if (bedV >= 0)
+      snprintf(bb, sizeof(bb), "%dC", bedV);
+    else
+      strcpy(bb, "--");
+    tft.drawString(bb, 62, 186);
+
+    // Chamber
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("CHM", 20, 206);
+    char cb[12];
+    if (chamberV >= 0) {
+      tft.setTextColor(C_CYAN, C_CARD);
+      snprintf(cb, sizeof(cb), "%dC", chamberV);
+    } else if (!modelHasChamberSensor(chamberModelName)) {
+      tft.setTextColor(C_DIM, C_CARD);
+      strcpy(cb, "N/A");
+    } else {
+      tft.setTextColor(C_DIM, C_CARD);
+      strcpy(cb, "--");
+    }
+    tft.drawString(cb, 62, 206);
+
+    cache.nozzleTemp = nozzleV;
+    cache.nozzleSide = nozzleSide;
+    cache.bedTemp = bedV;
+    cache.chamberTemp = chamberV;
+  }
+
+  // 4. Bottom Right Card: Remaining Time & ETA (y: 160, h: 68)
+  if (pr.remainingMin != cache.dashTimeRemaining ||
+      pr.status != cache.dashStatus) {
+    drawGlassCard(124, 160, 102, 68, 8);
+
+    // Header Label
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(1);
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("REMAINING", 175, 170);
+
+    // Value
+    tft.setTextFont(4);
+    tft.setTextColor(C_CYAN, C_CARD);
+    String rmText = (pr.status == "finish" || pr.progress >= 100)
+                        ? "DONE"
+                        : timeText(pr.remainingMin);
+    tft.drawString(rmText, 175, 190);
+
+    // ETA
+    tft.setTextFont(1);
+    tft.setTextColor(C_ORANGE, C_CARD);
+    String etaStr = (pr.status == "finish" || pr.progress >= 100)
+                        ? "DONE"
+                        : String("ETA ") + etaText();
+    tft.drawString(etaStr, 175, 213);
+
+    cache.dashTimeRemaining = pr.remainingMin;
+    cache.dashStatus = pr.status;
+  }
+}
+
+void drawBase() {
+  tft.fillScreen(BG_BLACK);
+  drawFrameTrack();
+  tft.drawBitmap(108, 102, BAMBU_LOGO, BAMBU_LOGO_W, BAMBU_LOGO_H, C_RING);
+  drawLabels();
+
+  cache.progress = -999;
+  cache.progressPct = -999;
+  cache.nozzleTemp = -999;
+  cache.nozzleSide = -2;
+  cache.bedTemp = -999;
+  cache.chamberTemp = -999;
+  cache.remainingMin = -999;
+  cache.currentLayer = -999;
+  cache.totalLayers = -999;
+  cache.status = "";
+  cache.displayName = "";
+  cache.model = "";
+  cache.alias = "";
+  cache.layout = "classic";
+  cache.baseDrawn = true;
+  cache.offlineDrawn = false;
+}
+
+void updateFields() {
+  int progressValue = pr.progress >= 0 ? (int)(pr.progress + 0.5f) : -1;
+  if (progressToLen(pr.progress) != cache.progress)
+    updateFrameProgress();
+  if (progressValue != cache.progressPct) {
+    char b[10];
+    if (progressValue >= 0) {
+      snprintf(b, sizeof(b), "%d", progressValue);
+      drawTextBox(72, 37, 96, 34, 4, C_TEXT, b, true);
+    } else {
+      drawTextBox(72, 37, 96, 34, 4, C_DIM, "--", true);
+    }
+    cache.progressPct = progressValue;
+  }
+
+  String st = statusText();
+  if (st != cache.status) {
+    drawTextBox(50, 67, 140, 30, 4, statusColor(), st, true);
+    drawLabels();
+    cache.status = st;
+  }
+
+  int nozzleSide = displayedNozzleSide();
+  bool nozzleSideChanged = nozzleSide != cache.nozzleSide;
+  if (nozzleSideChanged) {
+    drawLabels();
+    cache.nozzleSide = nozzleSide;
+  }
+
+  float nozzleTemp = displayedNozzleTemp();
+  int nozzle = nozzleTemp >= 0 ? (int)(nozzleTemp + 0.5f) : -1;
+  if (nozzle != cache.nozzleTemp || nozzleSideChanged) {
+    if (nozzleSide == 0 || nozzleSide == 1) {
+      drawDualNozzleTempBox(17, 116, 86, 30, nozzleSide, nozzle,
+                            nozzle >= 0 ? C_TEXT : C_DIM);
+    } else {
+      drawTempBox(21, 116, 86, 30, nozzle, nozzle >= 0 ? C_TEXT : C_DIM);
+    }
+    cache.nozzleTemp = nozzle;
+  }
+
+  int bed = pr.bedTemp >= 0 ? (int)(pr.bedTemp + 0.5f) : -1;
+  if (bed != cache.bedTemp) {
+    if (dualNozzleDisplayMode()) {
+      drawTempBoxSoft(133, 116, 86, 30, bed, bed >= 0 ? C_TEXT : C_DIM);
+    } else {
+      drawTempBox(133, 116, 86, 30, bed, bed >= 0 ? C_TEXT : C_DIM);
+    }
+    cache.bedTemp = bed;
+  }
+
+  if (pr.currentLayer != cache.currentLayer ||
+      pr.totalLayers != cache.totalLayers) {
+    char b[24];
+    if (pr.currentLayer >= 0 && pr.totalLayers > 0)
+      snprintf(b, sizeof(b), "%d/%d", pr.currentLayer, pr.totalLayers);
+    else
+      strcpy(b, "L--");
+    drawTextBox(50, 153, 140, 24, 2, C_TEXT, b, true);
+    cache.currentLayer = pr.currentLayer;
+    cache.totalLayers = pr.totalLayers;
+  }
+
+  if (pr.remainingMin != cache.remainingMin ||
+      (pr.remainingMin <= 0 && pr.displayName != cache.displayName)) {
+    String bottomText;
+    if (pr.status == "finish" || pr.progress >= 100) {
+      bottomText = "DONE";
+    } else if (pr.remainingMin > 0) {
+      int h = pr.remainingMin / 60;
+      int m = pr.remainingMin % 60;
+      char b[16];
+      if (h > 0)
+        snprintf(b, sizeof(b), "%d:%02d", h, m);
+      else
+        snprintf(b, sizeof(b), "%dm", m);
+      bottomText = b;
+    } else {
+      const String &label = stored.name.length() ? stored.name : pr.displayName;
+      bottomText =
+          fitTextToWidth(label.length() ? label : String("--"), 4, 204, true);
+    }
+    drawTextBox(18, 181, 204, 34, 4, C_CYAN, bottomText, true);
+    cache.remainingMin = pr.remainingMin;
+    cache.displayName = pr.displayName;
+  }
+}
+
+void drawClockScreen() {
+  bool fullRedraw = (cache.layout != "clock") || cache.clockSyncDrawn;
+  if (fullRedraw) {
+    cache.hour = -1;
+    cache.min = -1;
+    cache.sec = -1;
+    cache.clockProgressPct = -999;
+    cache.clockNozzleTemp = -999;
+    cache.clockBedTemp = -999;
+    cache.clockRemainingMin = -999;
+    cache.clockStatus = "";
+    cache.clockOnline = !pr.online;
+    cache.clockSyncDrawn = false;
+    tft.fillScreen(BG_BLACK);
+    tft.drawRoundRect(4, 4, 232, 232, 8, 0x294A);
+  }
+  time_t now = time(nullptr);
+  struct tm *info = localtime(&now);
+
+  if (!info || now < 1700000000) {
+    if (!cache.clockSyncDrawn) {
+    tft.fillScreen(BG_BLACK);
+    tft.drawRoundRect(4, 4, 232, 232, 8, 0x294A);
+    tft.setTextFont(4);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_DIM, BG_BLACK);
+    tft.drawString("SYNC...", 120, 120);
+      cache.clockSyncDrawn = true;
+    }
+    cache.hour = -1;
+    cache.min = -1;
+    cache.sec = -1;
+    cache.layout = "clock";
+    return;
+  }
+
+  int h = info->tm_hour;
+  int m = info->tm_min;
+  int s = info->tm_sec;
+  int y = info->tm_year + 1900;
+  int mo = info->tm_mon + 1;
+  int d = info->tm_mday;
+  int wd = info->tm_wday;
+
+  // 1. Header & Main Clock Card Base (Redrawn only on entry or when minute
+  // changes)
+  if (fullRedraw || h != cache.hour || m != cache.min) {
+    // Top Header Bar
+    drawGlassCard(14, 12, 108, 22, 11);
+    char dateStr[16];
+    snprintf(dateStr, sizeof(dateStr), "%04d.%02d.%02d", y, mo, d);
+    tft.setTextFont(2);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_TEXT, C_CARD);
+    tft.drawString(dateStr, 68, 23);
+
+    const char *weekdays[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+    drawGlassCard(128, 12, 64, 22, 11);
+    tft.setTextColor(0xFF40, C_CARD);
+    tft.drawString(weekdays[wd], 160, 23);
+
+    // Online LED dot
+    uint16_t ledColor = pr.online ? C_RING : C_ORANGE;
+    tft.fillCircle(208, 23, 5, ledColor);
+    tft.drawCircle(208, 23, 5, BG_BLACK);
+
+    // Main Clock Card Base
+    drawGlassCard(14, 42, 212, 108, 10);
+
+    // Draw time string HH MM
+    char timeStr[8];
+    snprintf(timeStr, sizeof(timeStr), "%02d %02d", h, m);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(7);
+
+    // Glow layers
+    tft.setTextColor(0x5940, C_CARD);
+    tft.drawString(timeStr, 122, 90);
+    tft.drawString(timeStr, 118, 90);
+    tft.drawString(timeStr, 122, 86);
+    tft.drawString(timeStr, 118, 86);
+
+    tft.setTextColor(0x9C40, C_CARD);
+    tft.drawString(timeStr, 121, 89);
+    tft.drawString(timeStr, 119, 89);
+    tft.drawString(timeStr, 121, 87);
+    tft.drawString(timeStr, 119, 87);
+
+    // Main text
+    tft.setTextColor(0xFF40, C_CARD);
+    tft.drawString(timeStr, 120, 88);
+
+    // Reset seconds bar track background on new minute
+    tft.fillRoundRect(26, 136, 188, 5, 2, BG_BLACK);
+
+    cache.hour = h;
+    cache.min = m;
+    cache.sec = -1; // Force seconds bar update for new minute
+  }
+
+  // 2. Seconds Colon & Incremental Seconds Bar (Zero-flicker)
+  if (fullRedraw || s != cache.sec) {
+    // Colon dots
+    if (s % 2 == 0) {
+      tft.fillCircle(120, 77, 3, 0xFF40);
+      tft.fillCircle(120, 99, 3, 0xFF40);
+    } else {
+      tft.fillCircle(120, 77, 3, C_CARD);
+      tft.fillCircle(120, 99, 3, C_CARD);
+    }
+
+    // Seconds bar incremental update
+    int newW = (s * 188) / 59;
+    if (s == 0) {
+      tft.fillRoundRect(26, 136, 188, 5, 2, BG_BLACK);
+    } else {
+      int oldW = cache.sec >= 0 ? (cache.sec * 188) / 59 : 0;
+      if (newW > oldW) {
+        tft.fillRect(26 + oldW, 136, newW - oldW, 5, 0xFF40);
+      }
+    }
+    cache.sec = s;
+  }
+
+  // 3. Bottom Printer Mini Status Card (ONLY REDRAWN ON PRINTER STATE CHANGE)
+  bool hasActivePrint =
+      pr.online && (isPrintingState(pr.status) || isPreparingState(pr.status) ||
+                    isPausedState(pr.status));
+  int pct = pr.progress >= 0 ? (int)(pr.progress + 0.5f) : 0;
+  int nozV = pr.nozzleTemp >= 0 ? (int)(pr.nozzleTemp + 0.5f) : -1;
+  int bedV = pr.bedTemp >= 0 ? (int)(pr.bedTemp + 0.5f) : -1;
+  String stStr = dashboardStatusText();
+  String stKey = clockStatusKey();
+
+  bool bottomDirty =
+      fullRedraw || (pr.online != cache.clockOnline) ||
+      (stKey != cache.clockStatus) || (pct != cache.clockProgressPct) ||
+      (nozV != cache.clockNozzleTemp) || (bedV != cache.clockBedTemp) ||
+      (pr.remainingMin != cache.clockRemainingMin);
+
+  if (bottomDirty) {
+    drawGlassCard(14, 158, 212, 68, 8);
+
+    if (hasActivePrint) {
+      // Active Print layout: Model & Status Pill, Progress bar, Temps/ETA
+      String modelStr =
+          normalizedModelName(pr.model.length() ? pr.model : stored.model);
+      tft.setTextFont(2);
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextColor(C_TEXT, C_CARD);
+      tft.drawString(fitTextToWidth(modelStr.length() ? modelStr : "PRINT", 2, 100, false), 24, 166);
+
+      // Status Pill on right (细分阶段：英文缩写 / 中文点阵)
+      drawHeaderStatus(204, 166, stStr, statusColor());
+
+      // Progress Bar
+      drawGlassProgress(24, 186, 180, 6, pct, 3);
+
+      // Temps & ETA / Remaining Time
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextFont(1);
+      tft.setTextColor(C_DIM, C_CARD);
+      char infoBuf[40];
+      snprintf(infoBuf, sizeof(infoBuf), "NOZ %dC  BED %dC",
+               nozV >= 0 ? nozV : 0, bedV >= 0 ? bedV : 0);
+      tft.drawString(infoBuf, 24, 198);
+
+      tft.setTextDatum(TR_DATUM);
+      tft.setTextFont(2);
+      tft.setTextColor(C_CYAN, C_CARD);
+      String rmText = (pr.status == "finish" || pr.progress >= 100)
+                          ? "DONE"
+                          : timeText(pr.remainingMin);
+      tft.drawString(rmText, 204, 198);
+
+    } else {
+      // Standby / Idle layout: Bambu Logo + Model Name + State
+      tft.drawBitmap(24, 176, BAMBU_LOGO, BAMBU_LOGO_W, BAMBU_LOGO_H, C_RING);
+
+      String modelStr =
+          normalizedModelName(pr.model.length() ? pr.model : stored.model);
+      String nameStr =
+          stored.name.length()
+              ? stored.name
+              : (pr.displayName.length() ? pr.displayName : modelStr);
+
+      tft.setTextFont(2);
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextColor(C_TEXT, C_CARD);
+      tft.drawString(
+          fitTextToWidth(nameStr.length() ? nameStr : "Printer", 2, 140, false),
+          56, 174);
+
+      tft.setTextFont(1);
+      tft.setTextColor(C_DIM, C_CARD);
+      tft.drawString(modelStr.length() ? modelStr : "Bambu Lab", 56, 194);
+
+      tft.setTextFont(2);
+      tft.setTextDatum(TR_DATUM);
+      if (!pr.online) {
+        tft.setTextColor(C_ORANGE, C_CARD);
+        tft.drawString("OFFLINE", 204, 184);
+      } else {
+        tft.setTextColor(C_CYAN, C_CARD);
+        tft.drawString("READY", 204, 184);
+      }
+    }
+
+    cache.clockOnline = pr.online;
+    cache.clockStatus = stKey;
+    cache.clockProgressPct = pct;
+    cache.clockNozzleTemp = nozV;
+    cache.clockBedTemp = bedV;
+    cache.clockRemainingMin = pr.remainingMin;
+  }
+
+  cache.layout = "clock";
+}
+void drawUiPanel(int x, int y, int w, int h, uint16_t bg = C_CARD) {
+  drawGlassCard(x, y, w, h, 8, bg);
+}
+
+String compactSpeedLabel() {
+  if (pr.spdLvl == 1) {
+    return String("SIL ") + (pr.spdMag > 0 ? String(pr.spdMag) : String("50")) + "%";
+  }
+  if (pr.spdLvl == 2) {
+    return String("STD ") + (pr.spdMag > 0 ? String(pr.spdMag) : String("100")) + "%";
+  }
+  if (pr.spdLvl == 3) {
+    return String("SPT ") + (pr.spdMag > 0 ? String(pr.spdMag) : String("124")) + "%";
+  }
+  if (pr.spdLvl == 4) {
+    return String("LUD ") + (pr.spdMag > 0 ? String(pr.spdMag) : String("166")) + "%";
+  }
+  return "SPD --";
+}
+
+void drawClassicHeaderSafe(const String &model, const String &status) {
+  drawUiPanel(16, 16, 208, 26);
+  String modelText = fitTextToWidth(model.length() ? model : "--", 2, 90, false);
+  String statusTextValue = status;
+  statusTextValue.toUpperCase();
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_TEXT, C_CARD);
+  tft.setTextPadding(0);
+  tft.drawString(modelText, 24, 20);
+  drawHeaderStatus(194, 20, statusTextValue, statusColor());
+  tft.fillCircle(207, 29, 4, isPrinterOnline() ? statusColor() : C_ORANGE);
+}
+
+void drawClassicHeroSafe(int progressValue) {
+  drawUiPanel(16, 48, 208, 56);
+  String numberText = progressValue >= 0 ? String(progressValue) : String("--");
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(7);
+  tft.setTextColor(C_TEXT, C_CARD);
+  tft.setTextPadding(0);
+  tft.drawString(numberText, 24, 51);
+  int numberWidth = tft.textWidth(numberText);
+  tft.setTextFont(4);
+  tft.setTextColor(C_RING, C_CARD);
+  tft.drawString("%", 27 + numberWidth, 76);
+
+  String layerText = "L --";
+  if (pr.currentLayer >= 0 && pr.totalLayers > 0) {
+    layerText = String("L ") + pr.currentLayer + "/" + pr.totalLayers;
+  } else if (pr.currentLayer >= 0) {
+    layerText = String("L ") + pr.currentLayer;
+  }
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_CYAN, C_CARD);
+  tft.drawString(fitTextToWidth(layerText, 2, 92, false), 216, 53);
+  tft.setTextFont(1);
+  tft.setTextColor(pr.spdLvl == 3 ? C_ORANGE : C_DIM, C_CARD);
+  tft.drawString(fitTextToWidth(compactSpeedLabel(), 1, 60, false), 216, 84);
+}
+
+void drawClassicLabelsSafe() {
+  tft.fillRect(20, 116, 90, 15, C_CARD);
+  tft.fillRect(130, 116, 90, 15, C_CARD);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(1);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.setTextPadding(0);
+  tft.drawString("NOZZLE", 65, 123);
+  tft.drawString("BED", 175, 123);
+}
+
+void drawClassicTempValueSafe(int x, int value, uint16_t color, bool dual, int side) {
+  String valueText = value < 0 ? String("--") : String(value);
+  if (dual && side >= 0) {
+    valueText = String(side == 1 ? "R " : "L ") + valueText;
+  }
+  valueText += "C";
+  drawTextBox(x, 133, 90, 23, 4, color, fitTextToWidth(valueText, 4, 84, true), true, C_CARD);
+}
+
+void drawClassicFooterSafe(const String &label, const String &value, bool largeValue) {
+  drawUiPanel(16, 168, 208, 52);
+  tft.drawBitmap(22, 178, BAMBU_LOGO, BAMBU_LOGO_W, BAMBU_LOGO_H, C_RING);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.setTextPadding(0);
+  tft.drawString(label, 56, 177);
+  if (largeValue) {
+    uint8_t valueFont = 4;
+    tft.setTextFont(valueFont);
+    if (tft.textWidth(value) + 1 > 78)
+      valueFont = 2;
+    drawTextBox(132, 176, 84, 34, valueFont, C_CYAN,
+                fitTextToWidth(value, valueFont, 78, true), true, C_CARD);
+  } else {
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(C_CYAN, C_CARD);
+    tft.drawString(fitTextToWidth(value, 2, 154, false), 56, 193);
+  }
+}
+
+void drawClassicBaseSafe() {
+  tft.fillScreen(BG_BLACK);
+  drawFrameTrack();
+  drawUiPanel(16, 16, 208, 26);
+  drawUiPanel(16, 48, 208, 56);
+  drawGlassCard(16, 112, 98, 48, 8, C_CARD, C_GLASS_LO, C_CARD);
+  drawGlassCard(126, 112, 98, 48, 8, C_CARD, C_GLASS_LO, C_CARD);
+  drawUiPanel(16, 168, 208, 52);
+  drawClassicLabelsSafe();
+  drawClassicFooterSafe("PRINTER", "--", false);
+
+  cache.progress = -999;
+  cache.progressPct = -999;
+  cache.nozzleTemp = -999;
+  cache.nozzleSide = -2;
+  cache.bedTemp = -999;
+  cache.remainingMin = -999;
+  cache.currentLayer = -999;
+  cache.totalLayers = -999;
+  cache.status = "";
+  cache.displayName = "";
+  cache.layout = "classic";
+  cache.baseDrawn = true;
+  cache.offlineDrawn = false;
+}
+
+void updateClassicFieldsSafe() {
+  String currentStatus = headerStatusText(statusText());
+  bool statusChanged = currentStatus != cache.status;
+  String model = getTopLeftDisplayName();
+  if (model != cache.model || statusChanged) {
+    drawClassicHeaderSafe(model, currentStatus);
+    cache.model = model;
+    cache.status = currentStatus;
+  }
+
+  int progressValue = pr.progress >= 0 ? (int)(pr.progress + 0.5f) : -1;
+  if (progressToLen(pr.progress) != cache.progress) {
+    drawFrameTrack();
+    drawFrameProgressLen(progressToLen(pr.progress), C_RING);
+    cache.progress = progressToLen(pr.progress);
+  }
+  bool heroDirty = progressValue != cache.progressPct ||
+                   pr.currentLayer != cache.currentLayer ||
+                   pr.totalLayers != cache.totalLayers ||
+                   pr.spdLvl != cache.spdLvl || pr.spdMag != cache.spdMag;
+  if (heroDirty) {
+    drawClassicHeroSafe(progressValue);
+    cache.progressPct = progressValue;
+    cache.currentLayer = pr.currentLayer;
+    cache.totalLayers = pr.totalLayers;
+    cache.spdLvl = pr.spdLvl;
+    cache.spdMag = pr.spdMag;
+  }
+
+  int side = displayedNozzleSide();
+  int nozzle = displayedNozzleTemp() >= 0 ? (int)(displayedNozzleTemp() + 0.5f) : -1;
+  int bed = pr.bedTemp >= 0 ? (int)(pr.bedTemp + 0.5f) : -1;
+  if (nozzle != cache.nozzleTemp || side != cache.nozzleSide) {
+    drawClassicTempValueSafe(20, nozzle, nozzle >= 0 ? C_YELLOW : C_DIM, side >= 0, side);
+    cache.nozzleTemp = nozzle;
+    cache.nozzleSide = side;
+  }
+  if (bed != cache.bedTemp) {
+    drawClassicTempValueSafe(130, bed, bed >= 0 ? C_ORANGE : C_DIM, false, -1);
+    cache.bedTemp = bed;
+  }
+
+  bool showRemaining = pr.remainingMin > 0 && pr.progress < 100 &&
+                       !isFinishedState(pr.status) && !isFailedState(pr.status);
+  bool footerDirty = pr.remainingMin != cache.remainingMin ||
+                     pr.displayName != cache.displayName || statusChanged;
+  if (footerDirty) {
+    if (showRemaining) {
+      drawClassicFooterSafe("REMAIN", classicRemainingText(pr.remainingMin),
+                            true);
+    } else {
+      const String &label = stored.name.length() ? stored.name : pr.displayName;
+      drawClassicFooterSafe("PRINTER", label.length() ? label : model, false);
+    }
+    cache.remainingMin = pr.remainingMin;
+    cache.displayName = pr.displayName;
+  }
+}
+
+void drawDashboardHeaderSafe() {
+  drawUiPanel(14, 10, 212, 22, C_CARD);
+  String model = getTopLeftDisplayName();
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_TEXT, C_CARD);
+  tft.setTextPadding(0);
+  tft.drawString(fitTextToWidth(model.length() ? model : "--", 2, 92, false), 24, 13);
+  drawHeaderStatus(196, 13, dashboardStatusText(), statusColor());
+  tft.fillCircle(206, 21, 4, isPrinterOnline() ? statusColor() : C_ORANGE);
+}
+
+void drawDashboardHeroSafe() {
+  tft.fillRect(16, 38, 208, 46, C_CARD);
+  tft.fillRect(17, 41, 2, 43, C_RING);
+  tft.drawFastHLine(24, 82, 192, C_RING);
+  int progressValue = pr.progress >= 0 ? (int)(pr.progress + 0.5f) : -1;
+  String numberText = progressValue >= 0 ? String(progressValue) : String("--");
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(7);
+  tft.setTextColor(C_TEXT, C_CARD);
+  tft.setTextPadding(0);
+  tft.drawString(numberText, 24, 37);
+  int numberWidth = tft.textWidth(numberText);
+  tft.setTextFont(4);
+  tft.setTextColor(C_RING, C_CARD);
+  tft.drawString("%", 27 + numberWidth, 59);
+
+  String layerText = "L --";
+  if (pr.currentLayer >= 0 && pr.totalLayers > 0)
+    layerText = String("L ") + pr.currentLayer + "/" + pr.totalLayers;
+  else if (pr.currentLayer >= 0)
+    layerText = String("L ") + pr.currentLayer;
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_CYAN, C_CARD);
+  tft.drawString(fitTextToWidth(layerText, 2, 90, false), 216, 40);
+  tft.setTextFont(1);
+  tft.setTextColor(pr.spdLvl == 3 ? C_ORANGE : C_DIM, C_CARD);
+  tft.drawString(fitTextToWidth(compactSpeedLabel(), 1, 60, false), 216, 66);
+}
+
+void drawDashboardFieldsSafe() {
+  String headerModel = getTopLeftDisplayName();
+  String headerStatus = headerStatusText(dashboardStatusText());
+  bool headerDirty = headerModel != cache.model || headerStatus != cache.status;
+  int progressValue = pr.progress >= 0 ? (int)(pr.progress + 0.5f) : -1;
+  bool heroDirty = progressValue != cache.progressPct ||
+                   pr.currentLayer != cache.currentLayer ||
+                   pr.totalLayers != cache.totalLayers ||
+                   pr.spdLvl != cache.spdLvl || pr.spdMag != cache.spdMag;
+  drawDashboardFields();
+  if (headerDirty) drawDashboardHeaderSafe();
+  if (heroDirty) drawDashboardHeroSafe();
+}
+
+void drawClockStatusSafe() {
+  drawUiPanel(14, 158, 212, 68, C_CARD);
+  bool active = pr.online && (isPrintingState(pr.status) ||
+                isPreparingState(pr.status) || isPausedState(pr.status));
+  if (active) {
+    String model = normalizedModelName(pr.model.length() ? pr.model : stored.model);
+    String status = dashboardStatusText();
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(C_TEXT, C_CARD);
+    tft.setTextPadding(0);
+    tft.drawString(fitTextToWidth(model.length() ? model : "PRINT", 2, 100, false), 24, 166);
+    drawHeaderStatus(204, 166, status, statusColor());
+    int pct = pr.progress >= 0 ? (int)(pr.progress + 0.5f) : 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    drawGlassProgress(24, 186, 180, 6, pct, 3);
+    int noz = pr.nozzleTemp >= 0 ? (int)(pr.nozzleTemp + 0.5f) : -1;
+    int bed = pr.bedTemp >= 0 ? (int)(pr.bedTemp + 0.5f) : -1;
+    char info[40];
+    snprintf(info, sizeof(info), "NOZ %dC  BED %dC", noz >= 0 ? noz : 0, bed >= 0 ? bed : 0);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(1);
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString(fitTextToWidth(info, 1, 108, false), 24, 198);
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(C_CYAN, C_CARD);
+    tft.drawString(fitTextToWidth(timeText(pr.remainingMin), 2, 56, false), 204, 198);
+    return;
+  }
+
+  tft.drawBitmap(24, 176, BAMBU_LOGO, BAMBU_LOGO_W, BAMBU_LOGO_H, C_RING);
+  String model = normalizedModelName(pr.model.length() ? pr.model : stored.model);
+  String name = stored.name.length() ? stored.name : (pr.displayName.length() ? pr.displayName : model);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_TEXT, C_CARD);
+  tft.setTextPadding(0);
+  tft.drawString(fitTextToWidth(name.length() ? name : "Printer", 2, 90, false), 56, 174);
+  tft.setTextFont(1);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.drawString(fitTextToWidth(model.length() ? model : "Bambu Lab", 1, 112, false), 56, 196);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(pr.online ? C_CYAN : C_ORANGE, C_CARD);
+  tft.drawString(pr.online ? "READY" : "OFFLINE", 204, 184);
+}
+
+void drawClockScreenSafe() {
+  bool statusDirty = cache.layout != "clock" || cache.clockSyncDrawn;
+  int pct = pr.progress >= 0 ? (int)(pr.progress + 0.5f) : 0;
+  int nozV = pr.nozzleTemp >= 0 ? (int)(pr.nozzleTemp + 0.5f) : -1;
+  int bedV = pr.bedTemp >= 0 ? (int)(pr.bedTemp + 0.5f) : -1;
+  String statusTextValue = clockStatusKey();
+  statusDirty = statusDirty || pr.online != cache.clockOnline ||
+                statusTextValue != cache.clockStatus ||
+                pct != cache.clockProgressPct ||
+                nozV != cache.clockNozzleTemp ||
+                bedV != cache.clockBedTemp ||
+                pr.remainingMin != cache.clockRemainingMin;
+  drawClockScreen();
+  time_t now = time(nullptr);
+  if (statusDirty && now >= 1700000000 && localtime(&now))
+    drawClockStatusSafe();
+}
+void renderOffline() {
+  if (cache.offlineDrawn)
+    return;
+  tft.startWrite();
+  tft.fillScreen(BG_BLACK);
+  drawFrameTrack();
+  drawTextBox(50, 93, 140, 34, 4, C_ORANGE, "OFFLINE", true);
+  String net = "NO WIFI";
+  if (WiFi.status() == WL_CONNECTED) {
+    net = String("IP ") + WiFi.localIP().toString();
+  } else if (WiFi.status() == WL_IDLE_STATUS ||
+             WiFi.status() == WL_DISCONNECTED) {
+    net = "WIFI...";
+  }
+  drawTextBox(28, 128, 184, 20, 2, C_DIM, net, false);
+  tft.endWrite();
+  cache.offlineDrawn = true;
+  cache.baseDrawn = false;
+}
+
+void renderDisplay() {
+  tft.startWrite();
+
+  bool hasActivePrint =
+      pr.online && (isPrintingState(pr.status) || isPreparingState(pr.status) ||
+                    isPausedState(pr.status));
+
+  if (stored.layout == "clock") {
+    drawClockScreenSafe();
+    cache.baseDrawn = false;
+    cache.offlineDrawn = false;
+  } else if (hasActivePrint) {
+    if (stored.layout == "dashboard") {
+      if (!cache.baseDrawn || cache.offlineDrawn || cache.layout != "dashboard")
+        drawDashboardBase();
+      drawDashboardFieldsSafe();
+    } else {
+      if (!cache.baseDrawn || cache.offlineDrawn || cache.layout != "classic")
+        drawClassicBaseSafe();
+      updateClassicFieldsSafe();
+    }
+  } else {
+    // Respect user layout choice when idle
+    if (stored.layout == "dashboard") {
+      if (!cache.baseDrawn || cache.offlineDrawn || cache.layout != "dashboard")
+        drawDashboardBase();
+      drawDashboardFieldsSafe();
+    } else if (stored.layout == "classic") {
+      if (!cache.baseDrawn || cache.offlineDrawn || cache.layout != "classic")
+        drawClassicBaseSafe();
+      updateClassicFieldsSafe();
+    } else {
+      drawClockScreenSafe();
+      cache.baseDrawn = false;
+      cache.offlineDrawn = false;
+    }
+  }
+
+  tft.endWrite();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  loadStoredConfig();
+  loadPrinterOptions();
+
+  tft.begin();
+  tft.invertDisplay(1);
+  applyDisplayOrientation();
+  pinMode(LCD_BL_PIN, OUTPUT);
+  analogWriteRange(1023);
+  analogWriteFreq(1000);
+  applyBrightness(stored.brightness);
+
+  tft.fillScreen(BG_BLACK);
+  drawTextBox(42, 92, 156, 28, 4, C_TEXT, "WIFI...", true);
+  mqttNet.setInsecure();
+  mqttNet.setBufferSizes(1024, 512);
+  mqttNet.setTimeout(8000);
+  wifiConnect();
+  if (wifiHasIp()) {
+    tft.fillScreen(BG_BLACK);
+    drawTextBox(24, 96, 192, 22, 2, C_TEXT, WiFi.localIP().toString(), true);
+    delay(800);
+  }
+  if (httpNetworkReady())
+    startEspServer();
+  applyBrightnessSchedule();
+  lastMqttConnect = 0;
+  mqttForceConnect = true;
+  renderDisplay();
+}
+
+void loop() {
+  unsigned long now = millis();
+  handleSerialConfig();
+  handleApiClient();
+
+  if (pendingHttpConfig) {
+    String body = pendingHttpConfigBody;
+    pendingHttpConfigBody = "";
+    pendingHttpConfig = false;
+    int statusCode = 200;
+    String response = applyConfigBody(body, statusCode);
+    Serial.println(response);
+  }
+
+  // Auto-heal web server: ensure listening whenever WiFi is connected (check every 3s)
+  static unsigned long lastServerCheck = 0;
+
+  if (now - lastServerCheck >= 3000) {
+    lastServerCheck = now;
+    if (WiFi.status() == WL_CONNECTED && wifiHasIp()) {
+      IPAddress curIp = WiFi.localIP();
+      if (!isEspServerListening() || curIp != lastRecordedIp) {
+        restartEspServer();
+      }
+    }
+  }
+
+  bool configMode = configClientConnected();
+  if (configMode && !lastConfigMode) {
+    mqttNet.stop();
+    lastMqttConnect = now;
+    restartEspServer();
+  }
+  lastConfigMode = configMode;
+  if (configMode && mqttNet.connected()) {
+    mqttNet.stop();
+    lastMqttConnect = now;
+  }
+
+  if (wifiReconnectPending) {
+    wifiReconnectPending = false;
+    mqttReconnectPending = false;
+    mqttNet.stop();
+    WiFi.disconnect();
+    delay(100);
+    wifiConnect();
+    lastMqttConnect = 0;
+    mqttForceConnect = true;
+    mqttReconnectDelay = MQTT_RECONNECT_INTERVAL;
+  } else if (mqttReconnectPending) {
+    mqttReconnectPending = false;
+    mqttNet.stop();
+    lastMqttConnect = 0;
+    mqttForceConnect = true;
+    mqttReconnectDelay = MQTT_RECONNECT_INTERVAL;
+  }
+
+  if (now - lastWifiCheck > 30000) {
+    lastWifiCheck = now;
+    if (WiFi.status() != WL_CONNECTED || !wifiHasIp()) {
+      wifiConnect();
+      if (httpNetworkReady())
+        restartEspServer();
+    }
+  }
+
+  if (!configMode && WiFi.status() == WL_CONNECTED && mqttConfigReady()) {
+    if (!mqttNet.connected()) {
+      if (pr.online) {
+        pr.online = false;
+        displayDirty = true;
+      }
+      if (mqttForceConnect || (now - lastMqttConnect >= mqttReconnectDelay)) {
+        mqttForceConnect = false;
+        lastMqttConnect = now;
+        if (!connectMqtt()) {
+          // Dynamic backoff on failure: 3s -> 6s -> 12s -> max 20s
+          if (mqttReconnectDelay < 20000) {
+            mqttReconnectDelay = (mqttReconnectDelay * 2 < 20000) ? (mqttReconnectDelay * 2) : 20000;
+          }
+        }
+      }
+    } else {
+      mqttHandleIncoming();
+      if (now - lastMqttPing >= 30000) {
+        mqttSendPing();
+      }
+      // Silent fallback: only request if no data has been received for MQTT_REQUEST_INTERVAL (30s)
+      // 同样用当前 millis()：lastMqttDataReceived/lastMqttRequest 在
+      // mqttHandleIncoming() 内更新，可能比顶部 now 新，回绕会误触发请求
+      unsigned long dataAge = millis() - lastMqttDataReceived;
+      if (dataAge >= MQTT_REQUEST_INTERVAL &&
+          millis() - lastMqttRequest >= 15000) {
+        requestPrinterState();
+      }
+    }
+  }
+
+  // 打印机关机：MQTT 连接可能还在，但收不到任何打印遥测 → 超时判离线
+  // 注意：必须用当前 millis() 计算——loop 顶部的 now 取自 mqttHandleIncoming
+  // 之前，lastPrinterActivity 可能比 now 新，now - lastPrinterActivity 会无符号
+  // 回绕成 ~42 亿，导致误判超时（每帧把 online 打回 False）
+  unsigned long activityAge = millis() - lastPrinterActivity;
+  if (pr.online && lastPrinterActivity > 0 &&
+      activityAge >= MQTT_OFFLINE_TIMEOUT) {
+    pr.online = false;
+    displayDirty = true;
+    Serial.printf("Printer silent for %lus, marking OFFLINE\n",
+                  (unsigned long)(activityAge / 1000));
+  }
+
+  // NTP time sync retry (every 60s if not synced)
+  static unsigned long lastNtpCheck = 0;
+  if (now - lastNtpCheck >= 60000) {
+    lastNtpCheck = now;
+    if (time(nullptr) < 1700000000 && WiFi.status() == WL_CONNECTED) {
+      configTime(8 * 3600, 0, "ntp.aliyun.com", "cn.pool.ntp.org",
+                 "pool.ntp.org");
+    }
+  }
+
+  // Brightness schedule check (every 3s for instant auto-apply on
+  // boot/time-sync)
+  static unsigned long lastBrsCheck = 0;
+  if (now - lastBrsCheck >= 3000) {
+    lastBrsCheck = now;
+    applyBrightnessSchedule();
+  }
+
+  if (hasDualNozzleTemps() && displayedNozzleSide() != cache.nozzleSide) {
+    displayDirty = true;
+  }
+
+  bool isClockMode = stored.layout == "clock";
+
+  if (isClockMode && now - lastDisplay >= 1000) {
+    displayDirty = true;
+  }
+
+  if (displayDirty && now - lastDisplay >= DISPLAY_REFRESH) {
+    displayDirty = false;
+    lastDisplay = now;
+    renderDisplay();
+  }
+
+  delay(10);
+}
